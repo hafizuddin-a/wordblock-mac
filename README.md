@@ -1,8 +1,24 @@
-# WordBlock
+<p align="center">
+  <img src="assets/logo.png" alt="WordBlock logo" width="200">
+</p>
 
-WordBlock deletes words you choose, in any Mac app, the moment you finish typing them. It is the Mac
-counterpart of Sentryboard, an Android keyboard that does the same thing: a small, self-imposed friction
-tool for a computer you own.
+<h1 align="center">WordBlock</h1>
+
+<p align="center">
+  Deletes the words you choose the moment you finish typing them, in any Mac app.
+</p>
+
+<p align="center">
+  <a href="../../releases/latest"><b>Download</b></a> ·
+  <a href="commands.txt"><b>Commands</b></a> ·
+  <a href="#install"><b>Install</b></a> ·
+  <a href="LICENSE"><b>MIT License</b></a>
+</p>
+
+<br>
+
+WordBlock is the Mac counterpart of Sentryboard, an Android keyboard that does the same thing: a small,
+self-imposed friction tool for a computer you own.
 
 - Whole-word matching that ignores case, accents and apostrophes, and catches letter swaps (`sh@t`, `h3ll`).
 - A **settings lock**: once locked, adding words is instant but removing them, switching the filter off or
