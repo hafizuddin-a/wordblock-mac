@@ -1,0 +1,5 @@
+WordBlock.app/
+wordblock
+dist/
+.build/
+.DS_Store

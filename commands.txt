@@ -1,0 +1,71 @@
+WORDBLOCK COMMANDS
+==================
+
+Run these in any terminal. WordBlock runs in the background and starts at login.
+
+  wordblock status             Show filter, lock and countdown state
+  wordblock add <word>         Add a word (always instant, even when locked)
+  wordblock remove <word>      Remove a word (only while the lock is open)
+  wordblock lock [minutes]     Lock the list. Default countdown is 60 minutes (1 min to 24 hours)
+  wordblock unlock             Start the countdown. When it ends you get a 5 minute window
+  wordblock cancel             Cancel a running countdown
+  wordblock disable            Switch the filter off (only while the lock is open)
+  wordblock enable             Switch the filter on (always allowed)
+  wordblock delay <minutes>    Change the countdown length (only while the lock is open)
+  wordblock stop               Quit the background program (only while the lock is open)
+  wordblock help               Show the command list
+
+
+WORD LIST
+=========
+
+File: ~/.config/wordblock/words.txt   One entry per line. Lines starting with # are ignored.
+
+  word     Blocked when you finish typing it (space, punctuation or Enter)
+  word*    Also blocks longer words that start with it (words, wording, not sword)
+  word!    Blocked the instant it is typed, without waiting for a space
+
+Matching is whole-word and ignores case, accents and apostrophes. Common letter
+swaps are caught too (0=o, 1=i or l, 3=e, 4=a, 5=s, 7=t, @=a, $=s).
+
+Pasted text, dictation and password fields are not filtered.
+
+
+HOW THE LOCK WORKS
+==================
+
+  - Adding words is always instant, by command or by editing words.txt.
+  - Deleting a line from words.txt does nothing: it is written back within a second.
+  - Removing words, disabling the filter or changing the delay needs:
+        wordblock unlock   ->  wait out the countdown  ->  5 minute window to make the change
+    The lock closes again by itself afterwards, and changes made in the window stay.
+  - The lock survives restarts. Killing the program restarts it within a few seconds.
+  - A damaged state file comes back locked with a 30 minute countdown.
+  - uninstall.sh refuses to run while the lock is on.
+
+
+FILES AND SCRIPTS (this folder)
+===============================
+
+  wordblock.swift    Source code
+  build.sh           Builds WordBlock.app (signed with the local "WordBlock Local Signing" certificate)
+  install.sh         Builds and installs to ~/Applications (the app registers its own login item
+                     and the `wordblock` command)
+  uninstall.sh       Removes the login item and app (refuses while locked; keeps your word list)
+  release.sh         Builds dist/WordBlock-<version>.zip for GitHub Releases
+  make-icon.swift    Generates WordBlock.icns
+
+  Opening WordBlock.app shows the first-run guide, or the current status once it is set up.
+  To see the guide again:  ~/Applications/WordBlock.app/Contents/MacOS/WordBlock --setup
+
+  Re-running install.sh keeps the Accessibility permission, because the signing identity is stable.
+  Log:   ~/Library/Logs/wordblock.log
+  State: ~/Library/Application Support/wordblock/state.json
+
+
+LIMITS
+======
+
+This is friction, not a security boundary. With an admin account you can still turn off
+WordBlock's Accessibility permission, run `launchctl bootout gui/$(id -u)/com.hafiz.wordblock`,
+edit the state file, or set the clock forward. Only a standard (non-admin) account closes those.
