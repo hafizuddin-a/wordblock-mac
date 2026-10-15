@@ -24,6 +24,12 @@ File: ~/.config/wordblock/words.txt   One entry per line. Lines starting with # 
   word     Blocked when you finish typing it (space, punctuation or Enter)
   word*    Also blocks longer words that start with it (words, wording, not sword)
   word!    Blocked the instant it is typed, without waiting for a space
+  hello world   A phrase of up to 6 words. When its last word is finished the whole phrase is
+                deleted, including the gaps between its words (up to 64 spaces, punctuation or
+                line breaks). * and ! apply to the last word. Each word is matched whole, with
+                the same case, accent and letter-swap handling as a single word.
+                The phrase is only caught if you type it in one go: clicking, arrow keys,
+                shortcuts or switching apps in between make WordBlock forget the earlier words.
 
 Matching is whole-word and ignores case, accents and apostrophes. Common letter
 swaps are caught too (0=o, 1=i or l, 3=e, 4=a, 5=s, 7=t, @=a, $=s).

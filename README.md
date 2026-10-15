@@ -64,6 +64,7 @@ Your words live in `~/.config/wordblock/words.txt`, one per line:
 | `word`  | Blocked when you finish typing it |
 | `word*` | Also blocks longer words that start with it (`words`, `wording`, not `sword`) |
 | `word!` | Blocked the instant it is typed |
+| `hello world` | A phrase of up to 6 words. The whole phrase is deleted when you finish its last word |
 
 ## What it can't do
 
@@ -71,8 +72,9 @@ Your words live in `~/.config/wordblock/words.txt`, one per line:
 - It is friction, not a security boundary. With an admin account you can still turn off WordBlock's
   Accessibility permission, unload its login item, edit its state file or set the clock forward. A standard
   (non-admin) account is the only thing that closes those.
-- Keyboard shortcuts, arrow keys, mouse clicks and switching apps make it forget the word in progress, so it
-  only ever deletes text it saw you type.
+- Keyboard shortcuts, arrow keys, mouse clicks and switching apps make it forget what you were typing, so it
+  only ever deletes text it saw you type. A phrase is only caught if you type it without doing any of those
+  in between.
 
 ## Build from source
 

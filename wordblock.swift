@@ -4,6 +4,9 @@
 //   word    blocks exactly that word, removed when you finish it (space, punctuation, Enter)
 //   word*   also blocks longer words that start with `word`
 //   word!   blocks exactly that word and removes it the instant it is typed
+//   hello world   a phrase of up to 6 words: when its last word is finished the whole phrase goes,
+//                 including the gaps (up to 64 spaces, punctuation or line breaks) between its words.
+//                 `*` and `!` apply to the last word.
 //
 // Settings lock (same idea as Sentryboard's): `wordblock lock` makes the list append-only.
 // Adding words is always instant. Removing words, disabling the filter or changing the delay
@@ -39,37 +42,75 @@ func normalize(_ word: String) -> Set<String> {
 }
 
 struct Entry {
-    let forms: Set<String>
+    let forms: Set<String>      // the last (or only) word
     let prefix: Bool
     let instant: Bool
+    let lead: [Set<String>]     // the words before it, for a phrase such as "hello world"
 }
 
 func isWordChar(_ ch: Character) -> Bool {
     ch.isLetter || ch.isNumber || ch == "'" || ch == "\u{2019}" || ch == "_" || ch == "@" || ch == "$"
 }
 
+let maxPhraseWords = 6
+let maxGap = 64  // longest run of non-word characters (spaces, punctuation, line breaks) between phrase words
+
+/// Collapses runs of whitespace, so "hello   world" and "hello world" are the same entry.
+func tidy(_ raw: String) -> String {
+    raw.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+}
+
 func parseEntry(_ raw: String) -> Entry? {
-    var s = raw.trimmingCharacters(in: .whitespaces)
+    var s = tidy(raw)
     if s.isEmpty || s.hasPrefix("#") { return nil }
     var prefix = false, instant = false
     if s.hasSuffix("*") { prefix = true; s.removeLast() }
     else if s.hasSuffix("!") { instant = true; s.removeLast() }
-    guard !s.isEmpty, s.allSatisfy(isWordChar), s.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
-    return Entry(forms: normalize(s), prefix: prefix, instant: instant)
+    let parts = s.split(separator: " ").map(String.init)
+    guard (1...maxPhraseWords).contains(parts.count),
+          parts.allSatisfy({ $0.allSatisfy(isWordChar) && $0.contains(where: { $0.isLetter || $0.isNumber }) }) else { return nil }
+    return Entry(forms: normalize(parts.last!), prefix: prefix, instant: instant,
+                 lead: parts.dropLast().map(normalize))
 }
 
-func matches(_ typed: String, _ entry: Entry, instantOnly: Bool) -> Bool {
-    if instantOnly && !entry.instant { return false }
+func formsMatch(_ typed: String, _ forms: Set<String>, prefix: Bool) -> Bool {
     // `@` and `$` at the very start or end of a word are ignored, so "@word" and "word$" are caught.
     let trimmed = typed.trimmingCharacters(in: CharacterSet(charactersIn: "@$"))
     let candidates = normalize(typed).union(trimmed.isEmpty ? [] : normalize(trimmed))
-    for form in entry.forms {
+    for form in forms {
         for c in candidates {
             if c == form { return true }
-            if entry.prefix && c.hasPrefix(form) && c.count > form.count { return true }
+            if prefix && c.hasPrefix(form) && c.count > form.count { return true }
         }
     }
     return false
+}
+
+/// If `text` ends with a blocked word or phrase, how many characters to delete: the phrase's words and the
+/// gaps between them, not whatever came before. With `instantOnly` only `!` entries count (checked per keystroke).
+func blockedLength(_ text: [Character], entries: [Entry], instantOnly: Bool) -> Int? {
+    var end = text.count
+    var start = end
+    while start > 0 && isWordChar(text[start - 1]) { start -= 1 }
+    guard start < end else { return nil }
+    let last = String(text[start..<end])
+    var best: Int?
+    for entry in entries where !instantOnly || entry.instant {
+        guard formsMatch(last, entry.forms, prefix: entry.prefix) else { continue }
+        var from = start, ok = true
+        for forms in entry.lead.reversed() {
+            end = from
+            while from > 0 && !isWordChar(text[from - 1]) { from -= 1 }
+            let gap = end - from
+            guard gap >= 1 && gap <= maxGap else { ok = false; break }
+            end = from
+            while from > 0 && isWordChar(text[from - 1]) { from -= 1 }
+            guard from < end, formsMatch(String(text[from..<end]), forms, prefix: false) else { ok = false; break }
+        }
+        if ok { best = max(best ?? 0, text.count - from) }
+        end = text.count
+    }
+    return best
 }
 
 // MARK: - Paths and settings
@@ -89,7 +130,7 @@ let windowSeconds = Double(env["WORDBLOCK_WINDOW"] ?? "") ?? 300  // how long se
 func fileEntries(_ text: String) -> [String] {
     var seen = Set<String>(), out: [String] = []
     for line in text.split(whereSeparator: \.isNewline) {
-        let s = line.trimmingCharacters(in: .whitespaces)
+        let s = tidy(String(line))
         if parseEntry(s) != nil && seen.insert(s).inserted { out.append(s) }
     }
     return out
@@ -102,7 +143,7 @@ let noTap = args.contains("--no-tap")  // daemon without the keyboard tap, for t
 if args.count >= 3 && args[1] == "--check" {
     let text = (try? String(contentsOf: listURL, encoding: .utf8)) ?? ""
     let list = fileEntries(text).compactMap(parseEntry)
-    print(list.contains { matches(args[2], $0, instantOnly: false) } ? "blocked" : "allowed")
+    print(blockedLength(Array(args[2...].joined(separator: " ")), entries: list, instantOnly: false) != nil ? "blocked" : "allowed")
     exit(0)
 }
 
@@ -394,10 +435,6 @@ func syncList(force: Bool = false) {
     listStamp = (try? FileManager.default.attributesOfItem(atPath: listURL.path)[.modificationDate]) as? Date
 }
 
-func isBlocked(_ word: String, instantOnly: Bool = false) -> Bool {
-    entries.contains { matches(word, $0, instantOnly: instantOnly) }
-}
-
 // MARK: - Commands
 
 func fmt(_ seconds: Double) -> String {
@@ -468,16 +505,17 @@ func handle(_ line: String) -> String {
 
     case "add":
         guard parseEntry(arg) != nil else {
-            return "error: an entry is one word of letters, digits and ' _ @ $, optionally ending in * or !\n"
+            return "error: an entry is a word (or up to \(maxPhraseWords) words separated by spaces) of letters, digits and ' _ @ $, optionally ending in * or !\n"
         }
-        if fileEntries(readList()).contains(arg) { return "already in the list.\n" }
-        appendLines([arg]); syncList(force: true)
-        return "added '\(arg)'.\n"
+        let entry = tidy(arg)
+        if fileEntries(readList()).contains(entry) { return "already in the list.\n" }
+        appendLines([entry]); syncList(force: true)
+        return "added '\(entry)'.\n"
 
     case "remove":
         if locked { return needUnlock }
         let lines = readList().split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
-        let kept = lines.filter { $0.trimmingCharacters(in: .whitespaces) != arg }
+        let kept = lines.filter { tidy(String($0)) != tidy(arg) }
         if kept.count == lines.count { return "'\(arg)' is not in the list.\n" }
         try? (kept.joined(separator: "\n")).write(to: listURL, atomically: true, encoding: .utf8)
         syncList(force: true)
@@ -566,7 +604,7 @@ func startServer() {
 
 let marker: Int64 = 0x57_42_4C_4B  // "WBLK": tags events we post ourselves so the tap ignores them
 let kBackspace: CGKeyCode = 51
-var buffer: [Character] = []
+var tail: [Character] = []  // recent text typed since the last reset, separators included
 var tapRef: CFMachPort?
 
 func post(keyCode: CGKeyCode, flags: CGEventFlags = [], text: String? = nil) {
@@ -589,9 +627,9 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon:
         if let tap = tapRef { CGEvent.tapEnable(tap: tap, enable: true) }
         return Unmanaged.passUnretained(event)
     }
-    if type == .leftMouseDown || type == .rightMouseDown { buffer.removeAll(); return Unmanaged.passUnretained(event) }
+    if type == .leftMouseDown || type == .rightMouseDown { tail.removeAll(); return Unmanaged.passUnretained(event) }
     guard type == .keyDown, event.getIntegerValueField(.eventSourceUserData) != marker, !state.disabled else {
-        buffer.removeAll()
+        tail.removeAll()
         return Unmanaged.passUnretained(event)
     }
 
@@ -599,45 +637,49 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon:
     let flags = event.flags
 
     // Shortcuts (paste, select all, ...) change the text without us seeing it: forget the word.
-    if flags.contains(.maskCommand) || flags.contains(.maskControl) { buffer.removeAll(); return Unmanaged.passUnretained(event) }
+    if flags.contains(.maskCommand) || flags.contains(.maskControl) { tail.removeAll(); return Unmanaged.passUnretained(event) }
 
-    if keyCode == kBackspace { _ = buffer.popLast(); return Unmanaged.passUnretained(event) }
+    if keyCode == kBackspace {
+        if flags.contains(.maskAlternate) { tail.removeAll() } else { _ = tail.popLast() }  // Option+Delete eats a whole word
+        return Unmanaged.passUnretained(event)
+    }
 
     var len = 0
     var chars = [UniChar](repeating: 0, count: 8)
     event.keyboardGetUnicodeString(maxStringLength: 8, actualStringLength: &len, unicodeString: &chars)
     let typed = String(utf16CodeUnits: chars, count: len)
-    guard let ch = typed.first, typed.count == 1 else { buffer.removeAll(); return Unmanaged.passUnretained(event) }
+    guard let ch = typed.first, typed.count == 1 else { tail.removeAll(); return Unmanaged.passUnretained(event) }
 
     // Arrows, Escape, function keys etc. arrive as control or private-use characters: the cursor moved.
     let scalar = ch.unicodeScalars.first!.value
     let isSeparatorKey = ch == " " || ch == "\r" || ch == "\n" || ch == "\t" || ch == "\u{3}"
     if !isSeparatorKey && (scalar < 0x20 || scalar == 0x7F || (0xF700...0xF8FF).contains(scalar)) {
-        buffer.removeAll()
+        tail.removeAll()
         return Unmanaged.passUnretained(event)
     }
 
     if isWordChar(ch) {
-        buffer.append(ch)
-        let word = String(buffer)
-        if isBlocked(word, instantOnly: true) {
+        tail.append(ch)
+        if tail.count > 2000 { tail.removeFirst(500) }
+        if let n = blockedLength(tail, entries: entries, instantOnly: true) {
             // Swallow the last key and erase what came before it, so the word never fully appears.
-            backspaces(buffer.count - 1)
-            buffer.removeAll()
+            backspaces(n - 1)
+            tail.removeLast(n)
             return nil
         }
         return Unmanaged.passUnretained(event)
     }
 
     // A separator ended the word. Underscore is a word char above, so "my_word" is handled at its own end.
-    let word = String(buffer)
-    buffer.removeAll()
-    if !word.isEmpty && isBlocked(word) {
-        // Erase the word, then re-send the separator so it lands after the deletion.
-        backspaces(word.count)
+    if let n = blockedLength(tail, entries: entries, instantOnly: false) {
+        // Erase the word or phrase, then re-send the separator so it lands after the deletion.
+        backspaces(n)
+        tail.removeLast(n)
+        tail.append(ch)
         post(keyCode: keyCode, flags: flags, text: typed)
         return nil
     }
+    tail.append(ch)
     return Unmanaged.passUnretained(event)
 }
 
@@ -670,7 +712,7 @@ if !noTap {
     }
     // Switching apps moves the cursor somewhere else.
     NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil) { _ in
-        buffer.removeAll()
+        tail.removeAll()
     }
 }
 
