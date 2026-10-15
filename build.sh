@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")"
 APP=WordBlock.app
-VERSION=1.0.0
+VERSION=1.1.0
 rm -rf "$APP" .build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" .build
 cp WordBlock.icns "$APP/Contents/Resources/"
