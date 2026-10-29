@@ -17,7 +17,7 @@
 
 <br>
 
-WordBlock is the Mac counterpart of Sentryboard, an Android keyboard that does the same thing: a small,
+WordBlock is the Mac counterpart of [Sentryboard](https://github.com/hafizuddin-a/sentryboard), an Android keyboard that does the same thing: a small,
 self-imposed friction tool for a computer you own.
 
 - Whole-word matching that ignores case, accents and apostrophes, and catches letter swaps (`sh@t`, `h3ll`).
