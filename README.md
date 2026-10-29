@@ -33,6 +33,18 @@ Requires macOS 12 or later (Apple Silicon and Intel).
 
 ## Install
 
+**With Terminal (quickest).** Files downloaded with `curl` are not quarantined, so macOS shows no
+"can't verify the developer" warning:
+
+```bash
+mkdir -p ~/Applications && curl -fsSL https://github.com/hafizuddin-a/wordblock-mac/releases/latest/download/WordBlock.zip -o /tmp/WordBlock.zip && ditto -x -k /tmp/WordBlock.zip ~/Applications && rm /tmp/WordBlock.zip && open ~/Applications/WordBlock.app
+```
+
+It installs to `~/Applications` and opens the first-run guide. To check the download first, compare
+`shasum -a 256 /tmp/WordBlock.zip` with the SHA-256 in the release notes before the `ditto` step.
+
+**Or by hand:**
+
 1. Download `WordBlock-<version>.zip` from the [Releases](../../releases) page and unzip it.
 2. Drag `WordBlock.app` to your Applications folder.
 3. Open it. macOS will say it can't verify the developer, because this app is not notarized by Apple:

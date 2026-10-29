@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds a release zip for GitHub Releases: dist/WordBlock-<version>.zip
+# Builds a release zip for GitHub Releases: dist/WordBlock-<version>.zip plus an identical dist/WordBlock.zip
 # Must be signed with the local certificate, so updates keep users' Accessibility permission.
 set -e
 cd "$(dirname "$0")"
@@ -12,5 +12,6 @@ mkdir -p dist
 ZIP="dist/WordBlock-$VERSION.zip"
 rm -f "$ZIP"
 ditto -c -k --norsrc --noextattr --keepParent WordBlock.app "$ZIP"
-echo "Created $ZIP"
+cp "$ZIP" dist/WordBlock.zip  # fixed name, so the README can link releases/latest/download/WordBlock.zip
+echo "Created $ZIP (and dist/WordBlock.zip)"
 shasum -a 256 "$ZIP"
