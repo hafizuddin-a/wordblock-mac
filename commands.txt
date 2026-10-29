@@ -40,13 +40,19 @@ Pasted text, dictation and password fields are not filtered.
 HOW THE LOCK WORKS
 ==================
 
-  - Adding words is always instant, by command or by editing words.txt.
-  - Deleting a line from words.txt does nothing: it is written back within a second.
+  - Adding words is always instant, by command or by typing a word into words.txt.
+  - While the lock is on, words.txt is hidden: it shows only how many words there are, not which.
+    A word you type into it is picked up within a second and hidden again. Deleting lines does
+    nothing. `wordblock add` gives the same answer whether or not the word was already listed.
+    The words come back into the file when the editing window opens.
   - Removing words, disabling the filter or changing the delay needs:
         wordblock unlock   ->  wait out the countdown  ->  5 minute window to make the change
     The lock closes again by itself afterwards, and changes made in the window stay.
   - The lock survives restarts. Killing the program restarts it within a few seconds.
-  - A damaged state file comes back locked with a 30 minute countdown.
+  - The lock state is signed and saved in three places (state.json, a preferences file, a backup in
+    ~/Library/Caches/com.hafiz.wordblock). Editing, deleting or restoring an old copy of one is undone
+    within a few seconds. If no copy has a valid signature it comes back locked with a 30 minute
+    countdown, and the words are kept.
   - uninstall.sh refuses to run while the lock is on.
 
 
@@ -74,4 +80,7 @@ LIMITS
 
 This is friction, not a security boundary. With an admin account you can still turn off
 WordBlock's Accessibility permission, run `launchctl bootout gui/$(id -u)/com.hafiz.wordblock`,
-edit the state file, or set the clock forward. Only a standard (non-admin) account closes those.
+edit the state file, or set the clock forward. Hiding the words is only a screen-level hiding: the
+list is kept in the state file (base64-encoded, not encrypted) so the program can read it. The
+signing key is a plain file next to state.json, so the signing stops hand edits, not someone who
+works out how it is signed. Only a standard (non-admin) account closes those.

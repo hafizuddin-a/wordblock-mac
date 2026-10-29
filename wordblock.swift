@@ -20,6 +20,7 @@
 
 import AppKit
 import CoreGraphics
+import CryptoKit
 
 // MARK: - Matching (same normalization as Sentryboard)
 
@@ -373,7 +374,7 @@ struct State: Codable {
     var locked = false
     var delay: Double = 3600       // countdown length in seconds
     var disabled = false           // master switch off (only settable while the lock is open)
-    var protected: [String] = []   // the list as of the last lock; while locked it can only grow
+    var protected: [String] = []   // the list as of the last lock, scrambled (see encode); while locked it can only grow
     var pendingAt: Double? = nil   // when the unlock countdown started
     var windowEnd: Double = 0      // end of the editing window after a finished countdown
     var lastSeen: Double = 0       // latest wall-clock time seen; the clock is never allowed to go backwards
@@ -384,19 +385,100 @@ var entries: [Entry] = []
 var listStamp: Date?
 var tickCount = 0
 
-func loadState() {
-    guard let data = try? Data(contentsOf: stateURL) else { return }
-    if let s = try? JSONDecoder().decode(State.self, from: data) {
-        state = s
-    } else {
-        // A damaged state file counts as locked with a 30 minute countdown, like Sentryboard.
-        state = State(locked: true, delay: 1800)
+// MARK: - Tamper-resistant state
+//
+// The state is saved in three places at once (state.json, a preferences file and a backup in Caches), each
+// copy signed with a random key kept in its own file. On start the newest copy with a valid signature wins
+// and the others are rewritten from it. So editing one copy, deleting one, or putting back an old one all
+// get undone. If copies exist but none is valid, the state counts as damaged: locked with 30 minutes, and
+// the protected words from every readable copy are kept (they can only grow, never shrink).
+// The key is a plain file, so this stops hand edits, not someone who works out how it is signed.
+// (The keychain would be better but ties access to the exact build, so every update would lose the key.)
+
+let prefs = UserDefaults(suiteName: env["WORDBLOCK_PREFS_SUITE"] ?? "com.hafiz.wordblock.state")!
+let keyURL = stateDir.appendingPathComponent("key")
+let backupURL = (env["WORDBLOCK_BACKUP_DIR"].map { URL(fileURLWithPath: $0) }
+    ?? home.appendingPathComponent("Library/Caches/com.hafiz.wordblock")).appendingPathComponent("state.bak")
+let fallbackKey = SymmetricKey(data: SHA256.hash(data: Data("wordblock-fallback-key".utf8)))
+var signKey = fallbackKey
+var stateRev = 0
+var lastWritten: Data?
+
+struct Envelope: Codable {
+    var rev: Int
+    var state: String  // the State as JSON text, signed byte for byte
+    var sig: String
+}
+
+/// Loads the signing key, creating it on first use.
+func initKeys() {
+    if let d = try? Data(contentsOf: keyURL), d.count == 32 { signKey = SymmetricKey(data: d); return }
+    var bytes = [UInt8](repeating: 0, count: 32)
+    guard SecRandomCopyBytes(kSecRandomDefault, 32, &bytes) == errSecSuccess else { return }
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    if (try? Data(bytes).write(to: keyURL, options: .atomic)) != nil {
+        chmod(keyURL.path, 0o600)
+        signKey = SymmetricKey(data: bytes)
     }
 }
 
+func sign(_ rev: Int, _ stateJSON: String) -> String {
+    Data(HMAC<SHA256>.authenticationCode(for: Data("\(rev).\(stateJSON)".utf8), using: signKey)).map { String(format: "%02x", $0) }.joined()
+}
+
+/// The state inside a copy, whether or not its signature checks out.
+func parseCopy(_ data: Data) -> (env: Envelope, state: State)? {
+    guard let env = try? JSONDecoder().decode(Envelope.self, from: data),
+          let st = try? JSONDecoder().decode(State.self, from: Data(env.state.utf8)) else { return nil }
+    return (env, st)
+}
+
+func openCopy(_ data: Data) -> (rev: Int, state: State)? {
+    guard let (env, st) = parseCopy(data), env.sig == sign(env.rev, env.state) else { return nil }
+    return (env.rev, st)
+}
+
+func readCopies() -> [Data] {
+    [try? Data(contentsOf: stateURL), prefs.data(forKey: "state"), try? Data(contentsOf: backupURL)].compactMap { $0 }
+}
+
+func loadState() {
+    initKeys()
+    let copies = readCopies()
+    let valid = copies.compactMap(openCopy)
+    if let best = valid.max(by: { $0.rev < $1.rev }) {
+        state = best.state; stateRev = best.rev
+        if copies.count < 3 || valid.count < copies.count || valid.contains(where: { $0.rev != best.rev }) { saveState() }
+        else { lastWritten = try? Data(contentsOf: stateURL) }
+        return
+    }
+    guard !copies.isEmpty else { return }  // first run
+    if let file = try? Data(contentsOf: stateURL), let old = try? JSONDecoder().decode(State.self, from: file) {
+        state = old; saveState(); return  // an unsigned state.json from before signing existed
+    }
+    // Damaged or edited: locked with a 30 minute countdown, like Sentryboard. Keep every protected word any
+    // readable copy still has, so a bad signature can never cost the list.
+    var words: [String] = []
+    for c in copies { for w in parseCopy(c)?.state.protected ?? [] where !words.contains(w) { words.append(w) } }
+    state = State(locked: true, delay: 1800, protected: words); saveState()
+}
+
 func saveState() {
+    stateRev += 1
+    guard let json = try? JSONEncoder().encode(state), let text = String(data: json, encoding: .utf8),
+          let data = try? JSONEncoder().encode(Envelope(rev: stateRev, state: text, sig: sign(stateRev, text))) else { return }
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-    if let data = try? JSONEncoder().encode(state) { try? data.write(to: stateURL, options: .atomic) }
+    try? FileManager.default.createDirectory(at: backupURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? data.write(to: stateURL, options: .atomic)
+    try? data.write(to: backupURL, options: .atomic)
+    prefs.set(data, forKey: "state")
+    lastWritten = data
+}
+
+/// Called every few seconds: if state.json no longer matches what was last written (edited, deleted,
+/// replaced), write the real state back over it.
+func guardStateFile() {
+    if (try? Data(contentsOf: stateURL)) != lastWritten { saveState() }
 }
 
 func now() -> Double { max(Date().timeIntervalSince1970, state.lastSeen) }
@@ -414,23 +496,69 @@ func appendLines(_ new: [String]) {
     try? text.write(to: listURL, atomically: true, encoding: .utf8)
 }
 
-func snapshotProtected() { state.protected = fileEntries(readList()) }
+/// The protected list is stored base64-encoded so it is not readable at a glance in state.json. This hides
+/// the words from a casual look, nothing more; the program has to be able to read them back.
+func encode(_ word: String) -> String { "b64:" + Data(word.utf8).base64EncodedString() }
+func decode(_ stored: String) -> String {
+    guard stored.hasPrefix("b64:"), let d = Data(base64Encoded: String(stored.dropFirst(4))) else { return stored }
+    return String(decoding: d, as: UTF8.self)
+}
+func protectedWords() -> [String] { state.protected.map(decode) }
+func setProtected(_ words: [String]) { state.protected = words.map(encode) }
 
-/// Rebuilds the active list from the word file. While locked, words can only be added: anything
-/// missing from the file is written back, and new words join the protected set.
+let hiddenMarker = "# WordBlock word list. The lock is on"
+func fileIsHidden() -> Bool { readList().hasPrefix(hiddenMarker) }
+
+/// Makes whatever the file holds the protected list. A file still showing the placeholder (the daemon was
+/// stopped while the window was open) adds nothing but must never wipe the list.
+func snapshotProtected() {
+    let inFile = fileEntries(readList())
+    setProtected(fileIsHidden() ? protectedWords() + inFile.filter { !protectedWords().contains($0) } : inFile)
+}
+
+/// What words.txt holds while the lock is on: the count, not the words. A word typed below is picked up
+/// within a second, added to the protected list and hidden again.
+func hiddenListText(count: Int) -> String {
+    """
+    \(hiddenMarker), so the \(count) word\(count == 1 ? " is" : "s are") hidden.
+    # To add a word, type it on a new line below and save. It is picked up within a second and hidden again.
+    # The words show here again after 'wordblock unlock' and the countdown.
+
+    """
+}
+
+var fileHidden = false  // words.txt currently holds the placeholder instead of the words
+
+/// Rebuilds the active list from the word file. While locked, words can only be added and the file shows a
+/// placeholder instead of the words: anything typed into it joins the protected set and is hidden again.
+/// When the editing window opens the words are written back into the file.
 func syncList(force: Bool = false) {
     let stamp = (try? FileManager.default.attributesOfItem(atPath: listURL.path)[.modificationDate]) as? Date
     guard force || stamp != listStamp else { return }
     let inFile = fileEntries(readList())
     if isLockedNow {
-        var grown = state.protected
+        var grown = protectedWords()
         for e in inFile where !grown.contains(e) { grown.append(e) }
-        if grown != state.protected { state.protected = grown; saveState() }
-        let missing = state.protected.filter { !inFile.contains($0) }
-        if !missing.isEmpty { appendLines(missing) }
-        entries = state.protected.compactMap(parseEntry)
+        if grown != protectedWords() || state.protected.contains(where: { !$0.hasPrefix("b64:") }) {
+            setProtected(grown); saveState()
+        }
+        let hidden = hiddenListText(count: grown.count)
+        if readList() != hidden || !fileHidden {
+            try? FileManager.default.createDirectory(at: listURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? hidden.write(to: listURL, atomically: true, encoding: .utf8)
+        }
+        fileHidden = true
+        entries = grown.compactMap(parseEntry)
     } else {
-        entries = inFile.compactMap(parseEntry)
+        if fileHidden {
+            // The window just opened: show the words again, plus anything added while they were hidden.
+            let words = protectedWords()
+            try? (listHeader + words.joined(separator: "\n") + "\n").write(to: listURL, atomically: true, encoding: .utf8)
+            fileHidden = false
+            entries = words.compactMap(parseEntry)
+        } else {
+            entries = inFile.compactMap(parseEntry)
+        }
     }
     listStamp = (try? FileManager.default.attributesOfItem(atPath: listURL.path)[.modificationDate]) as? Date
 }
@@ -508,6 +636,11 @@ func handle(_ line: String) -> String {
             return "error: an entry is a word (or up to \(maxPhraseWords) words separated by spaces) of letters, digits and ' _ @ $, optionally ending in * or !\n"
         }
         let entry = tidy(arg)
+        if locked {
+            // The list is hidden, so the answer must not reveal whether the word was already on it.
+            if !protectedWords().contains(entry) { appendLines([entry]); syncList(force: true) }
+            return "that word is on the list. The list is hidden while the lock is on.\n"
+        }
         if fileEntries(readList()).contains(entry) { return "already in the list.\n" }
         appendLines([entry]); syncList(force: true)
         return "added '\(entry)'.\n"
@@ -561,6 +694,7 @@ func tick() {
         if state.locked { snapshotProtected() }  // whatever the list is now becomes the protected list
     }
     if changed || tickCount % 30 == 0 { saveState() }
+    else if tickCount % 3 == 0 { guardStateFile() }
     syncList(force: changed)
     if tapRef == nil { installTap() }
 }
@@ -703,6 +837,7 @@ func installTap() {
 
 setvbuf(stdout, nil, _IOLBF, 0)  // line-buffer so messages reach a redirected log file
 loadState()
+fileHidden = fileIsHidden()
 syncList(force: true)
 startServer()
 

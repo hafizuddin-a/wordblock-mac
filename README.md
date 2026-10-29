@@ -22,7 +22,8 @@ self-imposed friction tool for a computer you own.
 
 - Whole-word matching that ignores case, accents and apostrophes, and catches letter swaps (`sh@t`, `h3ll`).
 - A **settings lock**: once locked, adding words is instant but removing them, switching the filter off or
-  changing the delay needs a countdown (1 hour by default).
+  changing the delay needs a countdown (1 hour by default). While locked, `words.txt` shows only how many
+  words there are, not which; they come back when you unlock.
 - Command line only. No menu bar icon, no account, no network access.
 
 It only looks at the word you are typing right now. Nothing you type is saved, logged or sent anywhere.
