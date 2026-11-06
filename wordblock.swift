@@ -12,6 +12,8 @@
 // Adding words is always instant. Removing words, disabling the filter or changing the delay
 // needs `wordblock unlock`, a countdown, and then a short window to make the change.
 //
+// Pasted text is checked too: blocked words are cut out of the clipboard before the app pastes it.
+//
 // Opened by double-click it shows a first-run guide (or the current status once set up).
 // `--daemon` is the background program launchd starts at login. With a command
 // (`wordblock status`, `lock`, `unlock`, ...) it talks to the running daemon.
@@ -26,16 +28,37 @@ import CryptoKit
 
 let leet: [Character: Character] = ["0": "o", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"]
 
-/// Lowercased, accent-free, apostrophe-free, leet-mapped. "1" is ambiguous (i or l) so it yields two variants.
+/// Letters of other alphabets drawn like a Latin letter, read as that letter, so a Cyrillic "e" in "hello"
+/// does not hide it. Applied to entries too, so an entry written in one of these alphabets still matches itself.
+let lookalike: [Character: Character] = [
+    "\u{0430}": "a", "\u{0435}": "e", "\u{043e}": "o", "\u{0440}": "p", "\u{0441}": "c", "\u{0445}": "x",
+    "\u{0443}": "y", "\u{0456}": "i", "\u{0458}": "j", "\u{0455}": "s", "\u{043a}": "k", "\u{04bb}": "h",
+    "\u{04cf}": "l", "\u{0501}": "d", "\u{051b}": "q", "\u{051d}": "w",                                   // Cyrillic
+    "\u{03bf}": "o", "\u{03b1}": "a", "\u{03bd}": "v", "\u{03c1}": "p", "\u{03b9}": "i", "\u{03ba}": "k",
+    "\u{03c5}": "u", "\u{03c7}": "x", "\u{03b5}": "e", "\u{03f2}": "c",                                   // Greek
+    "\u{0131}": "i", "\u{0251}": "a", "\u{0261}": "g",                                                     // Latin letters folding leaves alone
+]
+
+extension Character {
+    /// A zero-width space, joiner, soft hyphen and the like: invisible, so it can hide a word.
+    var isFormatChar: Bool { unicodeScalars.allSatisfy { $0.properties.generalCategory == .format } }
+    /// An accent written as a character of its own.
+    var isMarkChar: Bool {
+        unicodeScalars.allSatisfy { $0.properties.generalCategory == .nonspacingMark || $0.properties.generalCategory == .enclosingMark }
+    }
+}
+
+/// Lowercased, accent-free, apostrophe-free, leet-mapped, invisible characters dropped, lookalike letters read
+/// as Latin. "1" is ambiguous (i or l) so it yields two variants.
 func normalize(_ word: String) -> Set<String> {
     let base = word.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil).lowercased()
     var variants: [String] = [""]
     for ch in base {
-        if ch == "'" || ch == "\u{2019}" { continue }
+        if ch == "'" || ch == "\u{2019}" || ch.isFormatChar || ch.isMarkChar { continue }
         if ch == "1" {
             variants = variants.flatMap { [$0 + "i", $0 + "l"] }
         } else {
-            let mapped = leet[ch] ?? ch
+            let mapped = lookalike[ch] ?? leet[ch] ?? ch
             variants = variants.map { $0 + String(mapped) }
         }
     }
@@ -51,9 +74,11 @@ struct Entry {
 
 func isWordChar(_ ch: Character) -> Bool {
     ch.isLetter || ch.isNumber || ch == "'" || ch == "\u{2019}" || ch == "_" || ch == "@" || ch == "$"
+        || ch.isFormatChar || ch.isMarkChar
 }
 
 let maxPhraseWords = 6
+let maxDelete = 400  // never erase more than this many typed characters for one match, whatever a read of the text says
 let maxGap = 64  // longest run of non-word characters (spaces, punctuation, line breaks) between phrase words
 
 /// Collapses runs of whitespace, so "hello   world" and "hello world" are the same entry.
@@ -89,8 +114,9 @@ func formsMatch(_ typed: String, _ forms: Set<String>, prefix: Bool) -> Bool {
 
 /// If `text` ends with a blocked word or phrase, how many characters to delete: the phrase's words and the
 /// gaps between them, not whatever came before. With `instantOnly` only `!` entries count (checked per keystroke).
-func blockedLength(_ text: [Character], entries: [Entry], instantOnly: Bool) -> Int? {
-    var end = text.count
+func blockedLength(_ text: [Character], entries: [Entry], instantOnly: Bool, upTo limit: Int? = nil) -> Int? {
+    let total = limit ?? text.count
+    var end = total
     var start = end
     while start > 0 && isWordChar(text[start - 1]) { start -= 1 }
     guard start < end else { return nil }
@@ -108,10 +134,58 @@ func blockedLength(_ text: [Character], entries: [Entry], instantOnly: Bool) -> 
             while from > 0 && isWordChar(text[from - 1]) { from -= 1 }
             guard from < end, formsMatch(String(text[from..<end]), forms, prefix: false) else { ok = false; break }
         }
-        if ok { best = max(best ?? 0, text.count - from) }
-        end = text.count
+        if ok && total - from <= maxDelete { best = max(best ?? 0, total - from) }
+        end = total
     }
     return best
+}
+
+let maxScan = 20_000  // the most characters of a paste that are scanned
+
+/// Every blocked word and phrase in a block of text, such as a paste, as [start, end) character ranges that
+/// do not overlap (the widest match wins). The text is also read with "_" and with invisible characters as
+/// separators, so "my_word" and "hello<zero width space>world" are caught.
+func blockedSpans(_ input: [Character], entries: [Entry]) -> [Range<Int>] {
+    guard !entries.isEmpty, !input.isEmpty else { return [] }
+    var text = input
+    if text.count > maxScan {
+        text = Array(text[0..<maxScan])
+        while let last = text.last, isWordChar(last) { text.removeLast() }  // never cut a word in half
+    }
+    var variants = [text]
+    let hasUnderscore = text.contains("_"), hasFormat = text.contains { $0.isFormatChar }
+    if hasUnderscore { variants.append(text.map { $0 == "_" ? " " : $0 }) }
+    if hasFormat { variants.append(text.map { $0.isFormatChar ? " " : $0 }) }
+    if hasUnderscore && hasFormat { variants.append(text.map { $0 == "_" || $0.isFormatChar ? " " : $0 }) }
+
+    var found: [Range<Int>] = []
+    for v in variants {
+        for end in 1...v.count where isWordChar(v[end - 1]) && (end == v.count || !isWordChar(v[end])) {
+            if let n = blockedLength(v, entries: entries, instantOnly: false, upTo: end) { found.append((end - n)..<end) }
+        }
+    }
+    found.sort { $0.count != $1.count ? $0.count > $1.count : $0.lowerBound < $1.lowerBound }
+    var kept: [Range<Int>] = []
+    for r in found where !kept.contains(where: { $0.overlaps(r) }) { kept.append(r) }
+    return kept.sorted { $0.lowerBound < $1.lowerBound }
+}
+
+/// The text without the given ranges. A removal that would leave a doubled space (or a space at the edge of a
+/// line) takes one neighbouring space with it.
+func removeSpans(_ text: [Character], _ spans: [Range<Int>]) -> [Character] {
+    func inlineSpace(_ c: Character) -> Bool { c == " " || c == "\t" }
+    var cut = [Bool](repeating: false, count: text.count)
+    for r in spans {
+        for i in r { cut[i] = true }
+        let before = r.lowerBound > 0 ? text[r.lowerBound - 1] : nil
+        let after = r.upperBound < text.count ? text[r.upperBound] : nil
+        if let b = before, inlineSpace(b), after == nil || inlineSpace(after!) || after!.isNewline || ",.;:!?)]}".contains(after!) {
+            cut[r.lowerBound - 1] = true
+        } else if before == nil || before!.isNewline, let a = after, inlineSpace(a) {
+            cut[r.upperBound] = true
+        }
+    }
+    return text.enumerated().filter { !cut[$0.offset] }.map { $0.element }
 }
 
 // MARK: - Paths and settings
@@ -298,7 +372,7 @@ func runNoArgs() {
 
 // MARK: - CLI: talk to the running daemon
 
-let commands: Set<String> = ["status", "lock", "unlock", "cancel", "add", "remove", "disable", "enable", "delay", "stop"]
+let commands: Set<String> = ["status", "lock", "unlock", "cancel", "add", "remove", "disable", "enable", "paste", "delay", "stop"]
 
 let usage = """
 wordblock commands:
@@ -309,6 +383,7 @@ wordblock commands:
   unlock            start the countdown; when it ends you get a 5 minute window to make changes
   cancel            cancel a running countdown
   disable | enable  switch the filter off / on (disable needs the lock to be open)
+  paste on | off    check pasted text too (off needs the lock to be open)
   delay <minutes>   change the countdown length (needs the lock to be open)
   stop              quit the daemon (needs the lock to be open)
 """
@@ -374,6 +449,7 @@ struct State: Codable {
     var locked = false
     var delay: Double = 3600       // countdown length in seconds
     var disabled = false           // master switch off (only settable while the lock is open)
+    var pasteOff: Bool? = nil      // paste checking off (only settable while the lock is open); optional so older saves still load
     var protected: [String] = []   // the list as of the last lock, scrambled (see encode); while locked it can only grow
     var pendingAt: Double? = nil   // when the unlock countdown started
     var windowEnd: Double = 0      // end of the editing window after a finished countdown
@@ -588,6 +664,7 @@ func statusText() -> String {
     }
     return """
     filter:    \(state.disabled ? "OFF" : "on")
+    paste:     \(state.pasteOff == true ? "OFF" : "checked")
     lock:      \(lock)
     countdown: \(countdown)
     words:     \(entries.count) active
@@ -614,7 +691,7 @@ func handle(_ line: String) -> String {
             delay = minutes * 60
         }
         guard validDelay(delay) else { return "error: the delay must be between 1 minute and 24 hours.\n" }
-        state.delay = delay; state.locked = true; state.disabled = false
+        state.delay = delay; state.locked = true; state.disabled = false; state.pasteOff = nil
         state.pendingAt = nil; state.windowEnd = 0
         snapshotProtected(); saveState(); syncList(force: true)
         return "locked. Adding words stays instant. Removing words, turning the filter off or changing the delay now needs a \(fmt(delay)) countdown.\n"
@@ -662,6 +739,15 @@ func handle(_ line: String) -> String {
     case "enable":
         state.disabled = false; saveState()
         return "filter on.\n"
+
+    case "paste":
+        switch arg {
+        case "on": state.pasteOff = nil; saveState(); return "paste checking on.\n"
+        case "off":
+            if locked { return needUnlock }
+            state.pasteOff = true; saveState(); return "paste checking off.\n"
+        default: return "error: use 'wordblock paste on' or 'wordblock paste off'.\n"
+        }
 
     case "delay":
         if locked { return needUnlock }
@@ -734,10 +820,112 @@ func startServer() {
     }
 }
 
+// MARK: - Pasted text
+//
+// The filter works on the clipboard before the app reads it: on the paste keystroke, and by polling the
+// clipboard so a menu or right-click paste is covered too. Only the blocked words and phrases are cut out;
+// the rest of the paste stays. The result is plain text, so rich formatting is lost when something is removed.
+
+let pasteboard = env["WORDBLOCK_PASTEBOARD"].map { NSPasteboard(name: NSPasteboard.Name($0)) } ?? NSPasteboard.general
+let skipTypes = ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType",
+                 "org.nspasteboard.AutoGeneratedType", "com.agilebits.onepassword"].map { NSPasteboard.PasteboardType($0) }
+var pasteboardSeen = -1  // changeCount of the clipboard as last checked or written by us
+
+var pasteChecked: Bool { !state.disabled && state.pasteOff != true }
+
+/// The clipboard's text, unless it is a password manager's, a file copy, or has no text.
+func clipboardText() -> String? {
+    let types = pasteboard.types ?? []
+    if types.contains(where: { skipTypes.contains($0) }) || types.contains(.fileURL) { return nil }
+    return pasteboard.string(forType: .string)
+}
+
+func writeClipboard(_ chars: [Character]) {
+    pasteboard.clearContents()
+    pasteboard.setString(String(chars), forType: .string)
+    pasteboardSeen = pasteboard.changeCount
+}
+
+/// The text just before the cursor in the focused text field, read through Accessibility, so a phrase can be
+/// recognised after a click, an arrow key, a cut or a paste made WordBlock forget what was typed. Whole words
+/// only (a word cut off at the start is dropped). Nil when the app does not expose its text (some browsers
+/// and Electron apps) or the field is a password field.
+func textBeforeCursor(limit: Int = 200) -> [Character]? {
+    guard AXIsProcessTrusted() else { return nil }
+    // The system-wide element often answers "cannot complete"; asking the frontmost app directly is reliable.
+    guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 0.05)  // never hold up typing on a slow app
+    var focused: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+          let focused = focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
+    let element = focused as! AXUIElement
+    var role: CFTypeRef?
+    if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
+       (role as? String) == "AXSecureTextField" { return nil }
+    var selection: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selection) == .success,
+          let selection = selection, CFGetTypeID(selection) == AXValueGetTypeID() else { return nil }
+    var cursor = CFRange()
+    guard AXValueGetValue(selection as! AXValue, .cfRange, &cursor) else { return nil }
+    if cursor.location <= 0 { return [] }
+    let start = max(0, cursor.location - limit)
+    var range = CFRange(location: start, length: cursor.location - start)
+    guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+    var text: CFTypeRef?
+    guard AXUIElementCopyParameterizedAttributeValue(element, kAXStringForRangeParameterizedAttribute as CFString,
+                                                     rangeValue, &text) == .success, let string = text as? String else { return nil }
+    var chars = Array(string)
+    if start > 0 { while let first = chars.first, isWordChar(first) { chars.removeFirst() } }
+    return chars
+}
+
+/// Fills the typed-text memory from the text field when it is empty (after a reset or a fresh start).
+func seedTail() {
+    if tail.isEmpty, let before = textBeforeCursor() { tail = before }
+}
+
+/// Copy-time check, run a few times a second: cuts blocked words out of new clipboard text.
+func pollClipboard() {
+    guard pasteboard.changeCount != pasteboardSeen else { return }
+    pasteboardSeen = pasteboard.changeCount
+    guard pasteChecked, !entries.isEmpty, let text = clipboardText() else { return }
+    let chars = Array(text)
+    let spans = blockedSpans(chars, entries: entries)
+    if !spans.isEmpty { writeClipboard(removeSpans(chars, spans)) }
+}
+
+/// The paste keystroke (Cmd+V and its variants). Cuts blocked words out of the clipboard, and also catches a
+/// word split across what was typed and what is pasted ("hello wor" typed, "ld" pasted): the typed letters
+/// are erased too. Returns the number of typed characters to erase first, or nil if the paste can go through.
+func filterPaste() -> Int? {
+    seedTail()
+    guard pasteChecked, !entries.isEmpty, let text = clipboardText() else { tail.removeAll(); return nil }
+    let pasted = Array(text)
+    let joined = tail + pasted
+    var spans = blockedSpans(joined, entries: entries)
+    spans = spans.filter { $0.upperBound > tail.count }  // matches wholly inside the typed part were handled as typed
+    let erase = spans.map { $0.lowerBound }.filter { $0 < tail.count }.min().map { tail.count - $0 }
+    if spans.isEmpty {
+        tail += pasted
+        if tail.count > 2000 { tail.removeFirst(tail.count - 2000) }
+        return nil
+    }
+    // Keep the rest of the paste: drop the matches from the pasted part only (the typed part is erased by key).
+    let local = spans.map { max($0.lowerBound, tail.count) - tail.count ..< $0.upperBound - tail.count }
+    let cleaned = removeSpans(pasted, local)
+    if let n = erase { tail.removeLast(n) }
+    writeClipboard(cleaned)
+    tail += cleaned
+    if tail.count > 2000 { tail.removeFirst(tail.count - 2000) }
+    return erase ?? 0
+}
+
 // MARK: - Event tap
 
 let marker: Int64 = 0x57_42_4C_4B  // "WBLK": tags events we post ourselves so the tap ignores them
 let kBackspace: CGKeyCode = 51
+let kV: CGKeyCode = 9
 var tail: [Character] = []  // recent text typed since the last reset, separators included
 var tapRef: CFMachPort?
 
@@ -770,7 +958,16 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon:
     let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
     let flags = event.flags
 
-    // Shortcuts (paste, select all, ...) change the text without us seeing it: forget the word.
+    // Paste: check the clipboard, and keep tracking the pasted text as if it were typed.
+    if flags.contains(.maskCommand) && !flags.contains(.maskControl) && keyCode == kV {
+        guard let erase = filterPaste() else { return Unmanaged.passUnretained(event) }
+        // Something was cut out: erase any typed part of a split word, then send the paste again.
+        backspaces(erase)
+        if pasteboard.string(forType: .string)?.isEmpty == false { post(keyCode: kV, flags: flags) }
+        return nil
+    }
+
+    // Other shortcuts (select all, undo, ...) change the text without us seeing it: forget the word.
     if flags.contains(.maskCommand) || flags.contains(.maskControl) { tail.removeAll(); return Unmanaged.passUnretained(event) }
 
     if keyCode == kBackspace {
@@ -792,6 +989,7 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon:
         return Unmanaged.passUnretained(event)
     }
 
+    seedTail()  // after a click, arrow key, cut or paste the memory is empty: read what is before the cursor
     if isWordChar(ch) {
         tail.append(ch)
         if tail.count > 2000 { tail.removeFirst(500) }
@@ -852,6 +1050,7 @@ if !noTap {
 }
 
 Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in tick() }
+Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in pollClipboard() }
 
 print("wordblock running (lock \(state.locked ? "on" : "off")). \(entries.count) words from \(listURL.path)")
 installTap()

@@ -10,6 +10,7 @@ Run these in any terminal. WordBlock runs in the background and starts at login.
   wordblock unlock             Start the countdown. When it ends you get a 5 minute window
   wordblock cancel             Cancel a running countdown
   wordblock disable            Switch the filter off (only while the lock is open)
+  wordblock paste on|off       Check pasted text too (on by default). Off needs the lock to be open
   wordblock enable             Switch the filter on (always allowed)
   wordblock delay <minutes>    Change the countdown length (only while the lock is open)
   wordblock stop               Quit the background program (only while the lock is open)
@@ -28,13 +29,27 @@ File: ~/.config/wordblock/words.txt   One entry per line. Lines starting with # 
                 deleted, including the gaps between its words (up to 64 spaces, punctuation or
                 line breaks). * and ! apply to the last word. Each word is matched whole, with
                 the same case, accent and letter-swap handling as a single word.
-                The phrase is only caught if you type it in one go: clicking, arrow keys,
-                shortcuts or switching apps in between make WordBlock forget the earlier words.
+                After a click, arrow key, cut or paste WordBlock reads the text before the
+                cursor from the text field, so the phrase is still caught in most apps. Browsers
+                and Electron apps often do not share their text; there it is only caught if you
+                type it in one go.
 
 Matching is whole-word and ignores case, accents and apostrophes. Common letter
 swaps are caught too (0=o, 1=i or l, 3=e, 4=a, 5=s, 7=t, @=a, $=s).
 
-Pasted text, dictation and password fields are not filtered.
+PASTED TEXT
+
+Blocked words and phrases in the clipboard are cut out before the app can paste them; the rest of the
+paste stays (a space left doubled is tidied). This happens when you press Cmd+V (and Cmd+Shift+V,
+Cmd+Opt+Shift+V) and also a moment after anything is copied, so Edit > Paste and right-click Paste are
+covered too. If you typed the start of a word and paste the end ("hello wor" + "ld"), the typed letters
+are erased as well. The result is plain text, so bold and links are lost when something was removed.
+Password-manager clipboards, file copies and images are left alone.
+
+Words are also read through zero-width characters, stray accents and look-alike Cyrillic or Greek
+letters, so "b<zero width space>adword" or a Cyrillic "a" does not get past.
+
+Dictation, drag and drop, the emoji picker and password fields are not filtered.
 
 
 HOW THE LOCK WORKS

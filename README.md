@@ -24,6 +24,7 @@ self-imposed friction tool for a computer you own.
 - A **settings lock**: once locked, adding words is instant but removing them, switching the filter off or
   changing the delay needs a countdown (1 hour by default). While locked, `words.txt` shows only how many
   words there are, not which; they come back when you unlock.
+- **Pasted text is checked too.** Blocked words are cut out of the clipboard before the app pastes it.
 - Command line only. No menu bar icon, no account, no network access.
 
 It only looks at the word you are typing right now. Nothing you type is saved, logged or sent anywhere.
@@ -79,15 +80,36 @@ Your words live in `~/.config/wordblock/words.txt`, one per line:
 | `word!` | Blocked the instant it is typed |
 | `hello world` | A phrase of up to 6 words. The whole phrase is deleted when you finish its last word |
 
+## What it can see
+
+To work, WordBlock needs Accessibility access, which means it sees every key you press and what is on your
+clipboard. What it does with that:
+
+- It keeps the last couple of thousand characters you typed or pasted in memory, to recognise words and
+  phrases. Nothing is written to disk, logged or sent anywhere, and there is no networking code in the
+  program. The memory is gone when WordBlock quits.
+- When it needs the text before your cursor it reads a few hundred characters from the focused text field
+  through Accessibility, in memory only. Password fields are skipped.
+- It reads the clipboard to check it, and rewrites it only when a blocked word is in it. Clipboards marked
+  concealed or transient by password managers, file copies and images are left alone.
+- It never sends more than a few hundred backspaces for one match, so a misread of the text cannot make it
+  delete a large amount.
+- It stores your word list, the lock settings and a signed copy of them under your home folder, nothing else.
+
+It is not notarized by Apple, so check the source yourself if you want to be sure: it is one file,
+[wordblock.swift](wordblock.swift).
+
 ## What it can't do
 
-- Pasted text, dictation and password fields are not filtered.
+- Dictation, drag and drop, the emoji picker and password fields are not filtered. A paste that removes
+  something comes out as plain text (bold and links are lost).
 - It is friction, not a security boundary. With an admin account you can still turn off WordBlock's
   Accessibility permission, unload its login item, edit its state file or set the clock forward. A standard
   (non-admin) account is the only thing that closes those.
-- Keyboard shortcuts, arrow keys, mouse clicks and switching apps make it forget what you were typing, so it
-  only ever deletes text it saw you type. A phrase is only caught if you type it without doing any of those
-  in between.
+- Keyboard shortcuts, arrow keys, mouse clicks and switching apps make it forget what you were typing. It then
+  reads the text before the cursor from the text field (through Accessibility), so a phrase you finish after a
+  click, a cut or a paste is still caught. Some apps, mainly browsers and Electron apps, do not share their
+  text; there a phrase is only caught if you type it without doing any of those in between.
 
 ## Build from source
 
