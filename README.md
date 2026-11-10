@@ -92,6 +92,8 @@ clipboard. What it does with that:
   through Accessibility, in memory only. Password fields are skipped.
 - It reads the clipboard to check it, and rewrites it only when a blocked word is in it. Clipboards marked
   concealed or transient by password managers, file copies and images are left alone.
+- After you edit text it may read a few hundred characters on both sides of the cursor the same way, in
+  memory only, to catch a word you completed by deleting or inserting something in the middle of it.
 - It never sends more than a few hundred backspaces for one match, so a misread of the text cannot make it
   delete a large amount.
 - It stores your word list, the lock settings and a signed copy of them under your home folder, nothing else.

@@ -46,6 +46,13 @@ covered too. If you typed the start of a word and paste the end ("hello wor" + "
 are erased as well. The result is plain text, so bold and links are lost when something was removed.
 Password-manager clipboards, file copies and images are left alone.
 
+EDITS IN THE MIDDLE OF TEXT
+
+When typing pauses, WordBlock looks at the text around the cursor (in apps that share it). If a
+backspace, delete, cut, undo or a letter typed into the middle of a word leaves a blocked word or phrase
+at the cursor, it is removed straight away: "h|ello world" (after deleting the space) is erased in full,
+without having to go to the end and press space.
+
 Words are also read through zero-width characters, stray accents and look-alike Cyrillic or Greek
 letters, so "b<zero width space>adword" or a Cyrillic "a" does not get past.
 

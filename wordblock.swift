@@ -846,11 +846,9 @@ func writeClipboard(_ chars: [Character]) {
     pasteboardSeen = pasteboard.changeCount
 }
 
-/// The text just before the cursor in the focused text field, read through Accessibility, so a phrase can be
-/// recognised after a click, an arrow key, a cut or a paste made WordBlock forget what was typed. Whole words
-/// only (a word cut off at the start is dropped). Nil when the app does not expose its text (some browsers
-/// and Electron apps) or the field is a password field.
-func textBeforeCursor(limit: Int = 200) -> [Character]? {
+/// The focused text field of the frontmost app and its selection, read through Accessibility. Nil when the app
+/// does not expose its text (some browsers and Electron apps) or the field is a password field.
+func focusedField() -> (element: AXUIElement, selection: CFRange)? {
     guard AXIsProcessTrusted() else { return nil }
     // The system-wide element often answers "cannot complete"; asking the frontmost app directly is reliable.
     guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
@@ -866,18 +864,85 @@ func textBeforeCursor(limit: Int = 200) -> [Character]? {
     var selection: CFTypeRef?
     guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selection) == .success,
           let selection = selection, CFGetTypeID(selection) == AXValueGetTypeID() else { return nil }
-    var cursor = CFRange()
-    guard AXValueGetValue(selection as! AXValue, .cfRange, &cursor) else { return nil }
-    if cursor.location <= 0 { return [] }
-    let start = max(0, cursor.location - limit)
-    var range = CFRange(location: start, length: cursor.location - start)
-    guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+    var range = CFRange()
+    guard AXValueGetValue(selection as! AXValue, .cfRange, &range) else { return nil }
+    return (element, range)
+}
+
+func fieldString(_ element: AXUIElement, _ start: Int, _ length: Int) -> String? {
+    if length <= 0 { return "" }
+    var range = CFRange(location: start, length: length)
+    guard let value = AXValueCreate(.cfRange, &range) else { return nil }
     var text: CFTypeRef?
     guard AXUIElementCopyParameterizedAttributeValue(element, kAXStringForRangeParameterizedAttribute as CFString,
-                                                     rangeValue, &text) == .success, let string = text as? String else { return nil }
+                                                     value, &text) == .success else { return nil }
+    return text as? String
+}
+
+/// The text just before the cursor, so a phrase can be recognised after a click, an arrow key, a cut or a paste
+/// made WordBlock forget what was typed. Whole words only (a word cut off at the start is dropped).
+func textBeforeCursor(limit: Int = 200) -> [Character]? {
+    guard let (element, cursor) = focusedField() else { return nil }
+    if cursor.location <= 0 { return [] }
+    let start = max(0, cursor.location - limit)
+    guard let string = fieldString(element, start, cursor.location - start) else { return nil }
     var chars = Array(string)
     if start > 0 { while let first = chars.first, isWordChar(first) { chars.removeFirst() } }
     return chars
+}
+
+/// The text on both sides of the cursor (nothing selected), whole words only at the cut-off ends.
+func textAroundCursor(limit: Int = 200) -> (before: [Character], after: [Character])? {
+    guard let (element, cursor) = focusedField(), cursor.length == 0 else { return nil }
+    var count: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &count) == .success,
+          let total = (count as? NSNumber)?.intValue, cursor.location <= total else { return nil }
+    let start = max(0, cursor.location - limit)
+    let afterLength = min(limit, total - cursor.location)
+    guard let b = fieldString(element, start, cursor.location - start),
+          let a = fieldString(element, cursor.location, afterLength) else { return nil }
+    var before = Array(b), after = Array(a)
+    if start > 0 { while let first = before.first, isWordChar(first) { before.removeFirst() } }
+    if cursor.location + afterLength < total { while let last = after.last, isWordChar(last) { after.removeLast() } }
+    return (before, after)
+}
+
+/// After an edit: if the text now holds a blocked word or phrase that touches the cursor, how many characters
+/// to erase before it and after it. Deleting (backspace, cut, undo) counts a match that ends at the cursor
+/// or starts there; typing only counts a match the cursor is inside, since a word being typed is judged when
+/// you finish it.
+func editRemoval(before: [Character], after: [Character], deletion: Bool) -> (left: Int, right: Int)? {
+    let text = before + after, cursor = before.count
+    let hits = blockedSpans(text, entries: entries).filter {
+        deletion ? ($0.lowerBound <= cursor && cursor <= $0.upperBound) : ($0.lowerBound < cursor && cursor < $0.upperBound)
+    }
+    guard let span = hits.max(by: { $0.count < $1.count }) else { return nil }
+    return (max(0, cursor - span.lowerBound), max(0, span.upperBound - cursor))
+}
+
+var editWork: DispatchWorkItem?
+var pendingDeletion = false
+var lastOwnPost = Date.distantPast
+
+/// Checks the text around the cursor shortly after the last edit (the app needs a moment to apply the key).
+func scheduleEditCheck(deletion: Bool) {
+    pendingDeletion = pendingDeletion || deletion
+    editWork?.cancel()
+    let work = DispatchWorkItem { editCheck() }
+    editWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+}
+
+func editCheck() {
+    let deletion = pendingDeletion
+    pendingDeletion = false
+    // Skip while our own keystrokes are still landing, and when there is nothing to check.
+    guard !state.disabled, !entries.isEmpty, Date().timeIntervalSince(lastOwnPost) > 0.3,
+          let ctx = textAroundCursor(), let (left, right) = editRemoval(before: ctx.before, after: ctx.after, deletion: deletion),
+          left + right <= maxDelete else { return }
+    for _ in 0..<right { post(keyCode: kForwardDelete) }
+    backspaces(left)
+    tail = Array(ctx.before.dropLast(left))
 }
 
 /// Fills the typed-text memory from the text field when it is empty (after a reset or a fresh start).
@@ -926,10 +991,12 @@ func filterPaste() -> Int? {
 let marker: Int64 = 0x57_42_4C_4B  // "WBLK": tags events we post ourselves so the tap ignores them
 let kBackspace: CGKeyCode = 51
 let kV: CGKeyCode = 9
+let kForwardDelete: CGKeyCode = 117
 var tail: [Character] = []  // recent text typed since the last reset, separators included
 var tapRef: CFMachPort?
 
 func post(keyCode: CGKeyCode, flags: CGEventFlags = [], text: String? = nil) {
+    lastOwnPost = Date()
     for down in [true, false] {
         guard let e = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: down) else { continue }
         e.flags = flags
@@ -957,6 +1024,15 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon:
 
     let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
     let flags = event.flags
+
+    // Any edit can leave a blocked word next to the cursor (a space deleted between "h" and "ello", a letter
+    // typed into the middle of a word): look at the text around the cursor once typing pauses.
+    let cmd = flags.contains(.maskCommand)
+    if keyCode == kBackspace || keyCode == kForwardDelete || (cmd && (keyCode == 7 || keyCode == 6)) {  // delete, cut, undo
+        scheduleEditCheck(deletion: true)
+    } else if cmd && keyCode == kV {
+        scheduleEditCheck(deletion: false)
+    }
 
     // Paste: check the clipboard, and keep tracking the pasted text as if it were typed.
     if flags.contains(.maskCommand) && !flags.contains(.maskControl) && keyCode == kV {
@@ -989,6 +1065,7 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon:
         return Unmanaged.passUnretained(event)
     }
 
+    scheduleEditCheck(deletion: false)  // typed text: a letter put into the middle of a word can complete one
     seedTail()  // after a click, arrow key, cut or paste the memory is empty: read what is before the cursor
     if isWordChar(ch) {
         tail.append(ch)
