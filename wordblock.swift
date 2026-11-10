@@ -48,33 +48,68 @@ extension Character {
     }
 }
 
-/// Lowercased, accent-free, apostrophe-free, leet-mapped, invisible characters dropped, lookalike letters read
-/// as Latin. "1" is ambiguous (i or l) so it yields two variants.
-func normalize(_ word: String) -> Set<String> {
-    let base = word.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil).lowercased()
-    var variants: [String] = [""]
-    for ch in base {
-        if ch == "'" || ch == "\u{2019}" || ch.isFormatChar || ch.isMarkChar { continue }
-        if ch == "1" {
-            variants = variants.flatMap { [$0 + "i", $0 + "l"] }
-        } else {
-            let mapped = lookalike[ch] ?? leet[ch] ?? ch
-            variants = variants.map { $0 + String(mapped) }
+extension Unicode.Scalar {
+    /// Invisible, or attached to the letter before or after it (zero-width characters, joiners, accents). These are
+    /// ignored when words are compared. They are looked at one scalar at a time because Swift glues a joiner onto
+    /// the neighbouring letter, so a "Character" containing one is not itself a format character.
+    var isInvisibleInWord: Bool {
+        switch properties.generalCategory {
+        case .format, .nonspacingMark, .enclosingMark: return true
+        default: return false
         }
     }
-    return Set(variants)
+}
+
+/// A word in comparison form: lowercase, without accents, apostrophes or invisible characters, with look-alike
+/// letters read as Latin and the leet symbols as the letters they stand for. A "1" stays "1" because it stands
+/// for either "i" or "l" (see `sameLetter`); spelling out both versions of every "1" grows exponentially.
+func normalize(_ word: String) -> [Character] {
+    let base = word.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil).lowercased()
+    var out: [Character] = []
+    out.reserveCapacity(base.utf8.count)
+    for scalar in base.unicodeScalars {
+        if scalar.isInvisibleInWord || scalar == "'" || scalar == "\u{2019}" { continue }
+        let ch = Character(scalar)
+        out.append(lookalike[ch] ?? leet[ch] ?? ch)
+    }
+    return out
+}
+
+func sameLetter(_ a: Character, _ b: Character) -> Bool {
+    if a == b { return true }
+    if a == "1" { return b == "i" || b == "l" }
+    if b == "1" { return a == "i" || a == "l" }
+    return false
+}
+
+/// `word` is the entry's word, or with `prefix` a longer word that starts with it.
+func sameWord(_ word: [Character], _ entryWord: [Character], prefix: Bool) -> Bool {
+    if word.count == entryWord.count || (prefix && word.count > entryWord.count) {
+        return zip(word, entryWord).allSatisfy(sameLetter)
+    }
+    return false
 }
 
 struct Entry {
-    let forms: Set<String>      // the last (or only) word
+    let forms: [Character]      // the last (or only) word, in comparison form
     let prefix: Bool
     let instant: Bool
-    let lead: [Set<String>]     // the words before it, for a phrase such as "hello world"
+    let lead: [[Character]]     // the words before it, for a phrase such as "hello world"
 }
 
+/// Letters, digits, apostrophes, underscores and the leet symbols `@` and `$` make up words, and so do invisible
+/// characters (see `isInvisibleInWord`). A "Character" can be several scalars glued together (a letter and the
+/// joiner after it, or a number sign that attaches to the letter after it), so it counts as a word character
+/// when the first scalar that is not invisible is a letter or digit. An emoji joined with joiners is not.
 func isWordChar(_ ch: Character) -> Bool {
-    ch.isLetter || ch.isNumber || ch == "'" || ch == "\u{2019}" || ch == "_" || ch == "@" || ch == "$"
-        || ch.isFormatChar || ch.isMarkChar
+    if let a = ch.asciiValue {
+        return (a >= 48 && a <= 57) || (a >= 65 && a <= 90) || (a >= 97 && a <= 122) || a == 39 || a == 95 || a == 64 || a == 36
+    }
+    for scalar in ch.unicodeScalars where !scalar.isInvisibleInWord {
+        let c = Character(scalar)
+        return c.isLetter || c.isNumber || c == "\u{2019}"
+    }
+    return true  // nothing but invisible characters
 }
 
 let maxPhraseWords = 6
@@ -95,63 +130,77 @@ func parseEntry(_ raw: String) -> Entry? {
     let parts = s.split(separator: " ").map(String.init)
     guard (1...maxPhraseWords).contains(parts.count),
           parts.allSatisfy({ $0.allSatisfy(isWordChar) && $0.contains(where: { $0.isLetter || $0.isNumber }) }) else { return nil }
-    return Entry(forms: normalize(parts.last!), prefix: prefix, instant: instant,
-                 lead: parts.dropLast().map(normalize))
+    let words = parts.map(normalize)
+    guard words.allSatisfy({ !$0.isEmpty }) else { return nil }
+    return Entry(forms: words.last!, prefix: prefix, instant: instant, lead: Array(words.dropLast()))
 }
 
-func formsMatch(_ typed: String, _ forms: Set<String>, prefix: Bool) -> Bool {
-    // `@` and `$` at the very start or end of a word are ignored, so "@word" and "word$" are caught.
-    let trimmed = typed.trimmingCharacters(in: CharacterSet(charactersIn: "@$"))
-    let candidates = normalize(typed).union(trimmed.isEmpty ? [] : normalize(trimmed))
-    for form in forms {
-        for c in candidates {
-            if c == form { return true }
-            if prefix && c.hasPrefix(form) && c.count > form.count { return true }
-        }
-    }
-    return false
+/// The spellings of a word to compare: as written, and without `@` or `$` at its very start or end
+/// ("@word", "word$" are caught).
+func spellings(_ word: String) -> [[Character]] {
+    var out = [normalize(word)]
+    let trimmed = word.trimmingCharacters(in: CharacterSet(charactersIn: "@$"))
+    if trimmed != word && !trimmed.isEmpty { out.append(normalize(trimmed)) }
+    return out.filter { !$0.isEmpty }
 }
 
-/// If `text` ends with a blocked word or phrase, how many characters to delete: the phrase's words and the
-/// gaps between them, not whatever came before. With `instantOnly` only `!` entries count (checked per keystroke).
+func formsMatch(_ spellings: [[Character]], _ entryWord: [Character], prefix: Bool) -> Bool {
+    spellings.contains { sameWord($0, entryWord, prefix: prefix) }
+}
+
+/// If `text` (up to `limit`) ends with a blocked word or phrase, how many characters to delete: the phrase's words
+/// and the gaps between them, not whatever came before. With `instantOnly` only `!` entries count (checked per
+/// keystroke). An underscore normally belongs to a word ("snake_case"), but it also separates words, so
+/// "snake_word" is judged both ways.
 func blockedLength(_ text: [Character], entries: [Entry], instantOnly: Bool, upTo limit: Int? = nil) -> Int? {
-    let total = limit ?? text.count
-    var end = total
-    var start = end
-    while start > 0 && isWordChar(text[start - 1]) { start -= 1 }
-    guard start < end else { return nil }
-    let last = String(text[start..<end])
+    let total = min(limit ?? text.count, text.count)
+    guard total > 0 else { return nil }
+    let relevant = instantOnly ? entries.filter { $0.instant } : entries
+    guard !relevant.isEmpty else { return nil }
+    var best = blockedLengthPass(text, total, relevant, underscoreSplits: false)
+    if text[max(0, total - maxDelete)..<total].contains("_"),
+       let n = blockedLengthPass(text, total, relevant, underscoreSplits: true) {
+        best = max(best ?? 0, n)
+    }
+    return best
+}
+
+private func blockedLengthPass(_ text: [Character], _ total: Int, _ entries: [Entry], underscoreSplits: Bool) -> Int? {
+    func wordy(_ c: Character) -> Bool { isWordChar(c) && !(underscoreSplits && c == "_") }
+    var start = total
+    while start > 0 && wordy(text[start - 1]) { start -= 1 }
+    guard start < total else { return nil }
+    let last = spellings(String(text[start..<total]))
+    guard !last.isEmpty else { return nil }
     var best: Int?
-    for entry in entries where !instantOnly || entry.instant {
-        guard formsMatch(last, entry.forms, prefix: entry.prefix) else { continue }
+    for entry in entries where formsMatch(last, entry.forms, prefix: entry.prefix) {
         var from = start, ok = true
-        for forms in entry.lead.reversed() {
-            end = from
-            while from > 0 && !isWordChar(text[from - 1]) { from -= 1 }
+        for lead in entry.lead.reversed() {
+            var end = from
+            while from > 0 && !wordy(text[from - 1]) { from -= 1 }
             let gap = end - from
             guard gap >= 1 && gap <= maxGap else { ok = false; break }
             end = from
-            while from > 0 && isWordChar(text[from - 1]) { from -= 1 }
-            guard from < end, formsMatch(String(text[from..<end]), forms, prefix: false) else { ok = false; break }
+            while from > 0 && wordy(text[from - 1]) { from -= 1 }
+            guard from < end, formsMatch(spellings(String(text[from..<end])), lead, prefix: false) else { ok = false; break }
         }
         if ok && total - from <= maxDelete { best = max(best ?? 0, total - from) }
-        end = total
     }
     return best
 }
 
 let maxScan = 20_000  // the most characters of a paste that are scanned
+let maxRun = 256      // a run of letters longer than this is not a word and is not looked at in pasted text
 
 /// Every blocked word and phrase in a block of text, such as a paste, as [start, end) character ranges that
 /// do not overlap (the widest match wins). The text is also read with "_" and with invisible characters as
-/// separators, so "my_word" and "hello<zero width space>world" are caught.
+/// separators, so "my_word" and "hello<zero width space>world" are caught. Only the first `maxScan` characters
+/// are scanned.
 func blockedSpans(_ input: [Character], entries: [Entry]) -> [Range<Int>] {
     guard !entries.isEmpty, !input.isEmpty else { return [] }
-    var text = input
-    if text.count > maxScan {
-        text = Array(text[0..<maxScan])
-        while let last = text.last, isWordChar(last) { text.removeLast() }  // never cut a word in half
-    }
+    let limit = min(input.count, maxScan)
+    let text = input.count > limit + maxRun ? Array(input[0..<(limit + maxRun)]) : input
+    let cutShort = text.count < input.count  // the last word in `text` may continue past it
     var variants = [text]
     let hasUnderscore = text.contains("_"), hasFormat = text.contains { $0.isFormatChar }
     if hasUnderscore { variants.append(text.map { $0 == "_" ? " " : $0 }) }
@@ -160,8 +209,16 @@ func blockedSpans(_ input: [Character], entries: [Entry]) -> [Range<Int>] {
 
     var found: [Range<Int>] = []
     for v in variants {
-        for end in 1...v.count where isWordChar(v[end - 1]) && (end == v.count || !isWordChar(v[end])) {
-            if let n = blockedLength(v, entries: entries, instantOnly: false, upTo: end) { found.append((end - n)..<end) }
+        var i = 0
+        while i < v.count {
+            guard isWordChar(v[i]) else { i += 1; continue }
+            var j = i
+            while j < v.count && isWordChar(v[j]) { j += 1 }
+            let complete = !(cutShort && j == v.count)
+            if i < limit, complete, j - i <= maxRun, let n = blockedLength(v, entries: entries, instantOnly: false, upTo: j) {
+                found.append((j - n)..<j)
+            }
+            i = j
         }
     }
     found.sort { $0.count != $1.count ? $0.count > $1.count : $0.lowerBound < $1.lowerBound }
@@ -186,6 +243,24 @@ func removeSpans(_ text: [Character], _ spans: [Range<Int>]) -> [Character] {
         }
     }
     return text.enumerated().filter { !cut[$0.offset] }.map { $0.element }
+}
+
+// MARK: - Versions
+
+/// Whether version `a` is newer than `b` ("1.10.0" is newer than "1.9.2"). A `b` that is unknown, or not a dotted
+/// number (a development build), counts as older than anything.
+func versionIsNewer(_ a: String, than b: String?) -> Bool {
+    func parts(_ v: String) -> [Int]? {
+        let p = v.split(separator: ".").map { Int($0) }
+        return p.isEmpty || p.contains(where: { $0 == nil }) ? nil : p.map { $0! }
+    }
+    guard let b = b, let pb = parts(b) else { return true }
+    guard let pa = parts(a) else { return false }
+    for i in 0..<max(pa.count, pb.count) {
+        let x = i < pa.count ? pa[i] : 0, y = i < pb.count ? pb[i] : 0
+        if x != y { return x > y }
+    }
+    return false
 }
 
 // MARK: - Paths and settings
@@ -217,8 +292,9 @@ let args = CommandLine.arguments
 let noTap = args.contains("--no-tap")  // daemon without the keyboard tap, for testing the lock
 if args.count >= 3 && args[1] == "--check" {
     let text = (try? String(contentsOf: listURL, encoding: .utf8)) ?? ""
+    if text.hasPrefix("# WordBlock word list. The lock is on") { print("the list is hidden while the lock is on"); exit(3) }
     let list = fileEntries(text).compactMap(parseEntry)
-    print(blockedLength(Array(args[2...].joined(separator: " ")), entries: list, instantOnly: false) != nil ? "blocked" : "allowed")
+    print(blockedSpans(Array(args[2...].joined(separator: " ")), entries: list).isEmpty ? "allowed" : "blocked")
     exit(0)
 }
 
@@ -242,8 +318,24 @@ func launchctl(_ arguments: [String]) -> Int32 {
     return p.terminationStatus
 }
 
+struct AgentError: LocalizedError {
+    let errorDescription: String?
+    init(_ message: String) { errorDescription = message }
+}
+
+/// True once the daemon answers on its control socket (it opens it before anything else, even while it is
+/// still waiting for Accessibility access).
+func daemonAnswers(within seconds: Double) -> Bool {
+    let start = Date()
+    repeat {
+        if sendCommand("status") != nil { return true }
+        usleep(250_000)
+    } while Date().timeIntervalSince(start) < seconds
+    return false
+}
+
 /// Registers the login item for the app at `appPath`, (re)starts it, and links the `wordblock` command.
-/// The lock state lives on disk, so restarting never clears it.
+/// The lock state lives on disk, so restarting never clears it. Throws if the daemon does not come up.
 func installAgent(appPath: String) throws {
     let exe = appPath + "/Contents/MacOS/WordBlock"
     let logPath = home.appendingPathComponent("Library/Logs/wordblock.log").path
@@ -259,13 +351,18 @@ func installAgent(appPath: String) throws {
     let fm = FileManager.default
     try fm.createDirectory(at: agentPlist.deletingLastPathComponent(), withIntermediateDirectories: true)
     let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
-    launchctl(["bootout", "gui/\(getuid())/\(agentLabel)"])
-    usleep(700_000)  // let launchd finish tearing the old job down before registering again
-    try data.write(to: agentPlist, options: .atomic)
-    launchctl(["bootstrap", "gui/\(getuid())", agentPlist.path])
     try fm.createDirectory(at: cliLink.deletingLastPathComponent(), withIntermediateDirectories: true)
     try? fm.removeItem(at: cliLink)
     try fm.createSymbolicLink(atPath: cliLink.path, withDestinationPath: exe)
+
+    for attempt in 1...2 {
+        launchctl(["bootout", "gui/\(getuid())/\(agentLabel)"])
+        usleep(attempt == 1 ? 700_000 : 1_500_000)  // let launchd finish tearing the old job down before registering again
+        try data.write(to: agentPlist, options: .atomic)
+        launchctl(["bootstrap", "gui/\(getuid())", agentPlist.path])
+        if daemonAnswers(within: 6) { return }
+    }
+    throw AgentError("macOS did not start WordBlock. Check ~/Library/Logs/wordblock.log, or run: launchctl bootstrap gui/\(getuid()) \(agentPlist.path)")
 }
 
 func ask(_ title: String, _ text: String, _ buttons: [String]) -> Int {
@@ -285,12 +382,40 @@ let listHeader = """
 
 """
 
+/// The login item has to run from a fixed place, so it keeps working if the download is deleted or moved. An app
+/// that is not in an Applications folder is copied to ~/Applications first (the old copy is only replaced once
+/// the new one is in place). Returns the path to run from, or nil after telling the user what went wrong.
+func stablePath(for appPath: String) -> String? {
+    if ["/Applications/", home.path + "/Applications/"].contains(where: { appPath.hasPrefix($0) }) { return appPath }
+    let fm = FileManager.default
+    let staging = installedApp.deletingLastPathComponent().appendingPathComponent("WordBlock.app.new")
+    do {
+        try fm.createDirectory(at: installedApp.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? fm.removeItem(at: staging)
+        try fm.copyItem(at: URL(fileURLWithPath: appPath), to: staging)
+        let x = Process()  // the user already approved this app, so the copy needn't be quarantined again
+        x.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+        x.arguments = ["-dr", "com.apple.quarantine", staging.path]
+        try? x.run(); x.waitUntilExit()
+        launchctl(["bootout", "gui/\(getuid())/\(agentLabel)"])
+        try? fm.removeItem(at: installedApp)
+        try fm.moveItem(at: staging, to: installedApp)
+        return installedApp.path
+    } catch {
+        try? fm.removeItem(at: staging)
+        _ = ask("Could not copy WordBlock", "\(error.localizedDescription)\n\nMove WordBlock.app to your Applications folder and open it again.", ["Quit"])
+        return nil
+    }
+}
+
+func appVersion() -> String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev" }
+
 func runGuide() {
     NSApplication.shared.setActivationPolicy(.accessory)
 
     if ask("Welcome to WordBlock",
-           "WordBlock deletes words you choose, in any app, the moment you finish typing them.\n\n"
-         + "It only looks at the word you are typing right now. It never saves or sends what you type, and it has no network access.\n\n"
+           "WordBlock deletes words you choose, in any app, the moment you finish typing them. It checks pasted text too.\n\n"
+         + "It keeps what you type in memory only, to recognise your words. It never saves or sends it, and it has no network access.\n\n"
          + "Setup takes about a minute:\n  1. Allow Accessibility access\n  2. Pick your words\n  3. Start WordBlock",
            ["Continue", "Quit"]) == 1 { return }
 
@@ -323,24 +448,7 @@ func runGuide() {
         _ = ask("Save your list", "Come back and click Continue once you have saved your words.", ["Continue"])
     }
 
-    // Run from a fixed place, so the login item keeps working if the download is deleted or moved.
-    var appPath = Bundle.main.bundlePath
-    if !["/Applications/", home.path + "/Applications/"].contains(where: { appPath.hasPrefix($0) }) {
-        launchctl(["bootout", "gui/\(getuid())/\(agentLabel)"])
-        try? fm.createDirectory(at: installedApp.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? fm.removeItem(at: installedApp)
-        do {
-            try fm.copyItem(at: URL(fileURLWithPath: appPath), to: installedApp)
-            appPath = installedApp.path
-            let x = Process()  // the user already approved this app, so the copy needn't be quarantined again
-            x.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-            x.arguments = ["-dr", "com.apple.quarantine", appPath]
-            try? x.run(); x.waitUntilExit()
-        } catch {
-            _ = ask("Could not copy WordBlock", "\(error.localizedDescription)\n\nMove WordBlock.app to your Applications folder and open it again.", ["Quit"])
-            return
-        }
-    }
+    guard let appPath = stablePath(for: Bundle.main.bundlePath) else { return }
     do { try installAgent(appPath: appPath) } catch {
         _ = ask("Could not start WordBlock", error.localizedDescription, ["Quit"])
         return
@@ -359,11 +467,25 @@ func runGuide() {
 func runNoArgs() {
     NSApplication.shared.setActivationPolicy(.accessory)
     if let status = sendCommand("status") {
+        // Replacing the app on disk does not restart the program that is already running: offer to.
+        let running = status.split(separator: "\n").first { $0.hasPrefix("version:") }.map { $0.dropFirst(8).trimmingCharacters(in: .whitespaces) }
+        if appVersion() != "dev" && running != appVersion() && versionIsNewer(appVersion(), than: running) {
+            let was = running.map { "version \($0)" } ?? "an older version"
+            if ask("WordBlock was updated", "WordBlock is running \(was), and this app is version \(appVersion()). Restart it so the new version runs? Your words and lock are kept.",
+                   ["Restart", "Not now"]) == 0, let path = stablePath(for: Bundle.main.bundlePath) {
+                do { try installAgent(appPath: path); _ = ask("WordBlock restarted", "Now running version \(appVersion()).", ["OK"]) }
+                catch { _ = ask("Could not restart WordBlock", error.localizedDescription, ["OK"]) }
+            }
+            return
+        }
         _ = ask("WordBlock is running", status + "\nUse the wordblock command in Terminal to change settings. Run \"wordblock help\" for the list.", ["OK"])
     } else if FileManager.default.fileExists(atPath: agentPlist.path) {
         if ask("WordBlock isn't running", "Start it now?", ["Start", "Cancel"]) == 0 {
             launchctl(["bootstrap", "gui/\(getuid())", agentPlist.path])
             launchctl(["kickstart", "gui/\(getuid())/\(agentLabel)"])
+            if !daemonAnswers(within: 6) {
+                _ = ask("Could not start WordBlock", "Check ~/Library/Logs/wordblock.log for the reason.", ["OK"])
+            }
         }
     } else {
         runGuide()
@@ -397,11 +519,15 @@ func sendCommand(_ cmd: String) -> String? {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
     }
     guard rc == 0 else { return nil }
+    var tv = timeval(tv_sec: 10, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     _ = cmd.withCString { write(fd, $0, strlen($0)) }
     var out = Data()
     var buf = [UInt8](repeating: 0, count: 4096)
     while true {
         let n = read(fd, &buf, buf.count)
+        if n < 0 && errno == EINTR { continue }
+        if n < 0 && out.isEmpty { return "error: WordBlock did not answer in time. Try again.\n" }
         if n <= 0 { break }
         out.append(contentsOf: buf[0..<n])
     }
@@ -637,6 +763,7 @@ func syncList(force: Bool = false) {
         }
     }
     listStamp = (try? FileManager.default.attributesOfItem(atPath: listURL.path)[.modificationDate]) as? Date
+    pasteboardSeen = -1  // the words changed: look at the clipboard again
 }
 
 // MARK: - Commands
@@ -663,6 +790,7 @@ func statusText() -> String {
         if let p = state.pendingAt { countdown = "running, \(fmt(p + state.delay - n)) left" }
     }
     return """
+    version:   \(appVersion())
     filter:    \(state.disabled ? "OFF" : "on")
     paste:     \(state.pasteOff == true ? "OFF" : "checked")
     lock:      \(lock)
@@ -724,6 +852,7 @@ func handle(_ line: String) -> String {
 
     case "remove":
         if locked { return needUnlock }
+        if arg.isEmpty { return "error: give the entry to remove, for example: wordblock remove someword\n" }
         let lines = readList().split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
         let kept = lines.filter { tidy(String($0)) != tidy(arg) }
         if kept.count == lines.count { return "'\(arg)' is not in the list.\n" }
@@ -737,12 +866,12 @@ func handle(_ line: String) -> String {
         return "filter off.\n"
 
     case "enable":
-        state.disabled = false; saveState()
+        state.disabled = false; pasteboardSeen = -1; saveState()
         return "filter on.\n"
 
     case "paste":
         switch arg {
-        case "on": state.pasteOff = nil; saveState(); return "paste checking on.\n"
+        case "on": state.pasteOff = nil; pasteboardSeen = -1; saveState(); return "paste checking on.\n"
         case "off":
             if locked { return needUnlock }
             state.pasteOff = true; saveState(); return "paste checking off.\n"
@@ -782,7 +911,7 @@ func tick() {
     if changed || tickCount % 30 == 0 { saveState() }
     else if tickCount % 3 == 0 { guardStateFile() }
     syncList(force: changed)
-    if tapRef == nil { installTap() }
+    checkTap()
 }
 
 // MARK: - Control socket
@@ -804,9 +933,11 @@ func startServer() {
     unlink(sockPath)
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     var addr = makeAddr(sockPath)
+    let oldMask = umask(0o177)  // owner only from the moment the socket exists
     let rc = withUnsafePointer(to: &addr) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
     }
+    umask(oldMask)
     guard fd >= 0, rc == 0, listen(fd, 8) == 0 else {
         FileHandle.standardError.write(Data("Could not open the control socket at \(sockPath).\n".utf8))
         exit(1)
@@ -815,7 +946,7 @@ func startServer() {
     Thread.detachNewThread {
         while true {
             let client = accept(fd, nil, nil)
-            if client >= 0 { serve(client) }
+            if client >= 0 { serve(client) } else { usleep(100_000) }  // do not spin if accept keeps failing
         }
     }
 }
@@ -840,10 +971,22 @@ func clipboardText() -> String? {
     return pasteboard.string(forType: .string)
 }
 
-func writeClipboard(_ chars: [Character]) {
+func writeClipboard(_ text: String) {
     pasteboard.clearContents()
-    pasteboard.setString(String(chars), forType: .string)
+    pasteboard.setString(text, forType: .string)
     pasteboardSeen = pasteboard.changeCount
+}
+
+var axPausedUntil = Date.distantPast
+
+/// Runs an Accessibility read. These happen on the thread that handles keystrokes, so if one is slow (the app is
+/// busy or hung) Accessibility is left alone for a few seconds rather than holding up typing.
+func timedAX<T>(_ read: () -> T?) -> T? {
+    guard Date() >= axPausedUntil else { return nil }
+    let start = Date()
+    let result = read()
+    if Date().timeIntervalSince(start) > 0.04 { axPausedUntil = Date().addingTimeInterval(5) }
+    return result
 }
 
 /// The focused text field of the frontmost app and its selection, read through Accessibility. Nil when the app
@@ -882,29 +1025,34 @@ func fieldString(_ element: AXUIElement, _ start: Int, _ length: Int) -> String?
 /// The text just before the cursor, so a phrase can be recognised after a click, an arrow key, a cut or a paste
 /// made WordBlock forget what was typed. Whole words only (a word cut off at the start is dropped).
 func textBeforeCursor(limit: Int = 200) -> [Character]? {
-    guard let (element, cursor) = focusedField() else { return nil }
-    if cursor.location <= 0 { return [] }
-    let start = max(0, cursor.location - limit)
-    guard let string = fieldString(element, start, cursor.location - start) else { return nil }
-    var chars = Array(string)
-    if start > 0 { while let first = chars.first, isWordChar(first) { chars.removeFirst() } }
-    return chars
+    timedAX {
+        guard let (element, cursor) = focusedField() else { return nil }
+        if cursor.location <= 0 { return [] }
+        let start = max(0, cursor.location - limit)
+        guard let string = fieldString(element, start, cursor.location - start) else { return nil }
+        var chars = Array(string)
+        if start > 0 { while let first = chars.first, isWordChar(first) { chars.removeFirst() } }
+        return chars
+    }
 }
 
 /// The text on both sides of the cursor (nothing selected), whole words only at the cut-off ends.
-func textAroundCursor(limit: Int = 200) -> (before: [Character], after: [Character])? {
-    guard let (element, cursor) = focusedField(), cursor.length == 0 else { return nil }
-    var count: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &count) == .success,
-          let total = (count as? NSNumber)?.intValue, cursor.location <= total else { return nil }
-    let start = max(0, cursor.location - limit)
-    let afterLength = min(limit, total - cursor.location)
-    guard let b = fieldString(element, start, cursor.location - start),
-          let a = fieldString(element, cursor.location, afterLength) else { return nil }
-    var before = Array(b), after = Array(a)
-    if start > 0 { while let first = before.first, isWordChar(first) { before.removeFirst() } }
-    if cursor.location + afterLength < total { while let last = after.last, isWordChar(last) { after.removeLast() } }
-    return (before, after)
+func textAroundCursor(limit: Int = 200, needTextAfter: Bool = false) -> (before: [Character], after: [Character])? {
+    timedAX {
+        guard let (element, cursor) = focusedField(), cursor.length == 0 else { return nil }
+        var count: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &count) == .success,
+              let total = (count as? NSNumber)?.intValue, cursor.location <= total else { return nil }
+        if needTextAfter && cursor.location == total { return nil }  // nothing after the cursor: nothing new to find
+        let start = max(0, cursor.location - limit)
+        let afterLength = min(limit, total - cursor.location)
+        guard let b = fieldString(element, start, cursor.location - start),
+              let a = fieldString(element, cursor.location, afterLength) else { return nil }
+        var before = Array(b), after = Array(a)
+        if start > 0 { while let first = before.first, isWordChar(first) { before.removeFirst() } }
+        if cursor.location + afterLength < total { while let last = after.last, isWordChar(last) { after.removeLast() } }
+        return (before, after)
+    }
 }
 
 /// After an edit: if the text now holds a blocked word or phrase that touches the cursor, how many characters
@@ -938,7 +1086,7 @@ func editCheck() {
     pendingDeletion = false
     // Skip while our own keystrokes are still landing, and when there is nothing to check.
     guard !state.disabled, !entries.isEmpty, Date().timeIntervalSince(lastOwnPost) > 0.3,
-          let ctx = textAroundCursor(), let (left, right) = editRemoval(before: ctx.before, after: ctx.after, deletion: deletion),
+          let ctx = textAroundCursor(needTextAfter: !deletion), let (left, right) = editRemoval(before: ctx.before, after: ctx.after, deletion: deletion),
           left + right <= maxDelete else { return }
     for _ in 0..<right { post(keyCode: kForwardDelete) }
     backspaces(left)
@@ -955,35 +1103,40 @@ func pollClipboard() {
     guard pasteboard.changeCount != pasteboardSeen else { return }
     pasteboardSeen = pasteboard.changeCount
     guard pasteChecked, !entries.isEmpty, let text = clipboardText() else { return }
-    let chars = Array(text)
-    let spans = blockedSpans(chars, entries: entries)
-    if !spans.isEmpty { writeClipboard(removeSpans(chars, spans)) }
+    // Only the start of a very large clipboard is looked at, so copying a huge file cannot stall typing.
+    let head = Array(text.prefix(maxScan + maxRun))
+    let spans = blockedSpans(head, entries: entries)
+    if !spans.isEmpty { writeClipboard(String(removeSpans(head, spans)) + String(text.dropFirst(head.count))) }
 }
 
 /// The paste keystroke (Cmd+V and its variants). Cuts blocked words out of the clipboard, and also catches a
 /// word split across what was typed and what is pasted ("hello wor" typed, "ld" pasted): the typed letters
-/// are erased too. Returns the number of typed characters to erase first, or nil if the paste can go through.
+/// are erased too. Returns nil if the paste can go through untouched, otherwise the number of typed characters
+/// to erase first (0 if only the clipboard needed cleaning).
 func filterPaste() -> Int? {
     seedTail()
     guard pasteChecked, !entries.isEmpty, let text = clipboardText() else { tail.removeAll(); return nil }
-    let pasted = Array(text)
-    let joined = tail + pasted
-    var spans = blockedSpans(joined, entries: entries)
-    spans = spans.filter { $0.upperBound > tail.count }  // matches wholly inside the typed part were handled as typed
-    let erase = spans.map { $0.lowerBound }.filter { $0 < tail.count }.min().map { tail.count - $0 }
-    if spans.isEmpty {
-        tail += pasted
-        if tail.count > 2000 { tail.removeFirst(tail.count - 2000) }
-        return nil
+    let pasted = Array(text.prefix(maxScan + maxRun))
+    let rest = String(text.dropFirst(pasted.count))  // beyond the scanned part of a very large clipboard
+    // Matches wholly inside the typed part were handled as typed; the others reach into the paste.
+    let spans = blockedSpans(tail + pasted, entries: entries).filter { $0.upperBound > tail.count }
+    var cleaned = pasted
+    var erase: Int?
+    if !spans.isEmpty {
+        erase = spans.map { $0.lowerBound }.filter { $0 < tail.count }.min().map { tail.count - $0 }
+        // Keep the rest of the paste: drop the matches from the pasted part only (the typed part is erased by key).
+        let local = spans.map { max($0.lowerBound, tail.count) - tail.count ..< $0.upperBound - tail.count }
+        cleaned = removeSpans(pasted, local)
+        writeClipboard(String(cleaned) + rest)
+        if let n = erase { tail.removeLast(n) }
     }
-    // Keep the rest of the paste: drop the matches from the pasted part only (the typed part is erased by key).
-    let local = spans.map { max($0.lowerBound, tail.count) - tail.count ..< $0.upperBound - tail.count }
-    let cleaned = removeSpans(pasted, local)
-    if let n = erase { tail.removeLast(n) }
-    writeClipboard(cleaned)
-    tail += cleaned
-    if tail.count > 2000 { tail.removeFirst(tail.count - 2000) }
-    return erase ?? 0
+    if rest.isEmpty {
+        tail += cleaned
+        if tail.count > 2000 { tail.removeFirst(tail.count - 2000) }
+    } else {
+        tail.removeAll()  // the end of the paste was not read
+    }
+    return spans.isEmpty ? nil : (erase ?? 0)
 }
 
 // MARK: - Event tap
@@ -994,6 +1147,7 @@ let kV: CGKeyCode = 9
 let kForwardDelete: CGKeyCode = 117
 var tail: [Character] = []  // recent text typed since the last reset, separators included
 var tapRef: CFMachPort?
+var tapSource: CFRunLoopSource?
 
 func post(keyCode: CGKeyCode, flags: CGEventFlags = [], text: String? = nil) {
     lastOwnPost = Date()
@@ -1011,63 +1165,80 @@ func post(keyCode: CGKeyCode, flags: CGEventFlags = [], text: String? = nil) {
 
 func backspaces(_ n: Int) { for _ in 0..<n { post(keyCode: kBackspace) } }
 
+/// The Latin letter a Command shortcut stands for (Cmd+V is "v"), whatever the keyboard layout: on Dvorak the V
+/// key is not where it is on a US keyboard. Layouts without Latin letters (Russian, Greek...) keep their shortcuts
+/// on the US key positions, so there the physical key decides.
+func shortcutLetter(_ event: CGEvent, keyCode: CGKeyCode) -> Character? {
+    func usPosition() -> Character? {
+        switch keyCode { case 6: return "z"; case 7: return "x"; case 9: return "v"; default: return nil }
+    }
+    guard let chars = NSEvent(cgEvent: event)?.charactersIgnoringModifiers?.lowercased(), let c = chars.first,
+          chars.count == 1 else { return usPosition() }
+    return c.isASCII ? (c.isLetter ? c : nil) : usPosition()
+}
+
 func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
+    let pass = Unmanaged.passUnretained(event)
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         if let tap = tapRef { CGEvent.tapEnable(tap: tap, enable: true) }
-        return Unmanaged.passUnretained(event)
+        return pass
     }
-    if type == .leftMouseDown || type == .rightMouseDown { tail.removeAll(); return Unmanaged.passUnretained(event) }
-    guard type == .keyDown, event.getIntegerValueField(.eventSourceUserData) != marker, !state.disabled else {
-        tail.removeAll()
-        return Unmanaged.passUnretained(event)
-    }
+    if type == .leftMouseDown || type == .rightMouseDown { tail.removeAll(); return pass }
+    guard type == .keyDown else { return pass }
+    // Our own keystrokes (erasing a word, sending its separator again) are not the user typing: leave the memory alone.
+    if event.getIntegerValueField(.eventSourceUserData) == marker { return pass }
+    if state.disabled { tail.removeAll(); return pass }
 
     let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
     let flags = event.flags
+    let cmd = flags.contains(.maskCommand), ctrl = flags.contains(.maskControl)
+    let letter = cmd ? shortcutLetter(event, keyCode: keyCode) : nil
 
     // Any edit can leave a blocked word next to the cursor (a space deleted between "h" and "ello", a letter
     // typed into the middle of a word): look at the text around the cursor once typing pauses.
-    let cmd = flags.contains(.maskCommand)
-    if keyCode == kBackspace || keyCode == kForwardDelete || (cmd && (keyCode == 7 || keyCode == 6)) {  // delete, cut, undo
+    if keyCode == kBackspace || keyCode == kForwardDelete || letter == "x" || letter == "z" {  // delete, cut, undo
         scheduleEditCheck(deletion: true)
-    } else if cmd && keyCode == kV {
+    } else if letter == "v" {
         scheduleEditCheck(deletion: false)
     }
 
     // Paste: check the clipboard, and keep tracking the pasted text as if it were typed.
-    if flags.contains(.maskCommand) && !flags.contains(.maskControl) && keyCode == kV {
-        guard let erase = filterPaste() else { return Unmanaged.passUnretained(event) }
-        // Something was cut out: erase any typed part of a split word, then send the paste again.
+    if cmd && !ctrl && letter == "v" {
+        guard let erase = filterPaste() else { return pass }
+        if erase == 0 { return pass }  // only the clipboard needed cleaning, and that is done: let the paste go
+        // Part of a split word was typed: erase it, then send the paste again.
         backspaces(erase)
         if pasteboard.string(forType: .string)?.isEmpty == false { post(keyCode: kV, flags: flags) }
         return nil
     }
 
-    // Other shortcuts (select all, undo, ...) change the text without us seeing it: forget the word.
-    if flags.contains(.maskCommand) || flags.contains(.maskControl) { tail.removeAll(); return Unmanaged.passUnretained(event) }
+    // Other shortcuts (select all, ...) change the text without us seeing it: forget the word.
+    if cmd || ctrl { tail.removeAll(); return pass }
 
     if keyCode == kBackspace {
         if flags.contains(.maskAlternate) { tail.removeAll() } else { _ = tail.popLast() }  // Option+Delete eats a whole word
-        return Unmanaged.passUnretained(event)
+        return pass
     }
 
     var len = 0
     var chars = [UniChar](repeating: 0, count: 8)
     event.keyboardGetUnicodeString(maxStringLength: 8, actualStringLength: &len, unicodeString: &chars)
+    // Nothing typed, or a longer string than the buffer (text expanders send these): not something we follow.
+    guard len > 0, len <= chars.count else { tail.removeAll(); return pass }
     let typed = String(utf16CodeUnits: chars, count: len)
-    guard let ch = typed.first, typed.count == 1 else { tail.removeAll(); return Unmanaged.passUnretained(event) }
+    guard let ch = typed.first, typed.count == 1 else { tail.removeAll(); return pass }
 
     // Arrows, Escape, function keys etc. arrive as control or private-use characters: the cursor moved.
     let scalar = ch.unicodeScalars.first!.value
     let isSeparatorKey = ch == " " || ch == "\r" || ch == "\n" || ch == "\t" || ch == "\u{3}"
     if !isSeparatorKey && (scalar < 0x20 || scalar == 0x7F || (0xF700...0xF8FF).contains(scalar)) {
         tail.removeAll()
-        return Unmanaged.passUnretained(event)
+        return pass
     }
 
     scheduleEditCheck(deletion: false)  // typed text: a letter put into the middle of a word can complete one
     seedTail()  // after a click, arrow key, cut or paste the memory is empty: read what is before the cursor
-    if isWordChar(ch) {
+    if isWordChar(ch) && ch != "_" {
         tail.append(ch)
         if tail.count > 2000 { tail.removeFirst(500) }
         if let n = blockedLength(tail, entries: entries, instantOnly: true) {
@@ -1076,10 +1247,11 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon:
             tail.removeLast(n)
             return nil
         }
-        return Unmanaged.passUnretained(event)
+        return pass
     }
 
-    // A separator ended the word. Underscore is a word char above, so "my_word" is handled at its own end.
+    // A separator ended the word. So does an underscore, although it can also be part of one: "word_" is caught
+    // as soon as the underscore is typed, as in Sentryboard.
     if let n = blockedLength(tail, entries: entries, instantOnly: false) {
         // Erase the word or phrase, then re-send the separator so it lands after the deletion.
         backspaces(n)
@@ -1089,7 +1261,7 @@ func callback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon:
         return nil
     }
     tail.append(ch)
-    return Unmanaged.passUnretained(event)
+    return pass
 }
 
 let tapMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
@@ -1103,14 +1275,41 @@ func installTap() {
           let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                       eventsOfInterest: tapMask, callback: callback, userInfo: nil) else { return }
     tapRef = tap
-    CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+    tapSource = CFMachPortCreateRunLoopSource(nil, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), tapSource, .commonModes)
     CGEvent.tapEnable(tap: tap, enable: true)
     print("event tap active")
+}
+
+/// Run every second. Installs the tap once Accessibility access exists, and keeps it alive: macOS can switch a tap
+/// off (permission toggled, a slow moment) or invalidate it, and a dead tap would leave the filter silently off.
+func checkTap() {
+    guard let tap = tapRef else { installTap(); return }
+    if !CFMachPortIsValid(tap) {
+        if let source = tapSource { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes) }
+        tapRef = nil; tapSource = nil
+        print("event tap lost; creating a new one")
+        installTap()
+    } else if !CGEvent.tapIsEnabled(tap: tap) {
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
 }
 
 // MARK: - Daemon main
 
 setvbuf(stdout, nil, _IOLBF, 0)  // line-buffer so messages reach a redirected log file
+
+// Two daemons would fight over the state files and the control socket, and the stale one would undo the
+// other's changes. The lock is released by the system when the process ends, however it ends.
+try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+let instanceLock = open(stateDir.appendingPathComponent("daemon.lock").path, O_CREAT | O_RDWR, 0o600)
+var lockTries = 0
+while instanceLock >= 0 && flock(instanceLock, LOCK_EX | LOCK_NB) != 0 {  // an old one may still be shutting down
+    lockTries += 1
+    if lockTries > 12 { print("another WordBlock is already running; exiting"); exit(0) }
+    usleep(250_000)
+}
+
 loadState()
 fileHidden = fileIsHidden()
 syncList(force: true)

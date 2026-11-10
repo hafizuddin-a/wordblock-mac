@@ -20,14 +20,16 @@
 WordBlock is the Mac counterpart of [Sentryboard](https://github.com/hafizuddin-a/sentryboard), an Android keyboard that does the same thing: a small,
 self-imposed friction tool for a computer you own.
 
-- Whole-word matching that ignores case, accents and apostrophes, and catches letter swaps (`sh@t`, `h3ll`).
+- Whole-word matching that ignores case, accents, apostrophes and invisible characters, and catches letter
+  swaps (`sh@t`, `h3ll`) and look-alike letters from other alphabets. A word joined to others with underscores
+  (`snake_word`) is caught too.
 - A **settings lock**: once locked, adding words is instant but removing them, switching the filter off or
   changing the delay needs a countdown (1 hour by default). While locked, `words.txt` shows only how many
   words there are, not which; they come back when you unlock.
 - **Pasted text is checked too.** Blocked words are cut out of the clipboard before the app pastes it.
 - Command line only. No menu bar icon, no account, no network access.
 
-It only looks at the word you are typing right now. Nothing you type is saved, logged or sent anywhere.
+Nothing you type is saved, logged or sent anywhere (see [What it can see](#what-it-can-see)).
 The whole program is one file: [wordblock.swift](wordblock.swift).
 
 Requires macOS 12 or later (Apple Silicon and Intel).
@@ -55,6 +57,9 @@ It installs to `~/Applications` and opens the first-run guide. To check the down
    - Or, in Terminal: `xattr -dr com.apple.quarantine /Applications/WordBlock.app`
 4. Follow the guide. It asks you to allow Accessibility access, helps you pick your words, then starts
    WordBlock and sets it to run at every login.
+
+**Updating:** replace the app (or run the `curl` line again) and open it. If an older version is still running,
+WordBlock offers to restart it with the new one. Your words, lock and permissions carry over.
 
 Prefer to read the code first? It is all in this repository, and you can build it yourself (below).
 

@@ -34,7 +34,8 @@ File: ~/.config/wordblock/words.txt   One entry per line. Lines starting with # 
                 and Electron apps often do not share their text; there it is only caught if you
                 type it in one go.
 
-Matching is whole-word and ignores case, accents and apostrophes. Common letter
+Matching is whole-word and ignores case, accents, apostrophes and invisible characters. A word joined to
+others with underscores (snake_word) is caught as soon as the word ends or the underscore is typed. Common letter
 swaps are caught too (0=o, 1=i or l, 3=e, 4=a, 5=s, 7=t, @=a, $=s).
 
 PASTED TEXT
@@ -71,6 +72,7 @@ HOW THE LOCK WORKS
         wordblock unlock   ->  wait out the countdown  ->  5 minute window to make the change
     The lock closes again by itself afterwards, and changes made in the window stay.
   - The lock survives restarts. Killing the program restarts it within a few seconds.
+    Only one copy runs at a time; a second one exits at once.
   - The lock state is signed and saved in three places (state.json, a preferences file, a backup in
     ~/Library/Caches/com.hafiz.wordblock). Editing, deleting or restoring an old copy of one is undone
     within a few seconds. If no copy has a valid signature it comes back locked with a 30 minute
@@ -88,8 +90,10 @@ FILES AND SCRIPTS (this folder)
   uninstall.sh       Removes the login item and app (refuses while locked; keeps your word list)
   release.sh         Builds dist/WordBlock-<version>.zip for GitHub Releases
   make-icon.swift    Generates WordBlock.icns
+  tests/run.sh       Runs the tests (matching, typing, paste, fuzzing). Nothing is typed into your session
 
-  Opening WordBlock.app shows the first-run guide, or the current status once it is set up.
+  Opening WordBlock.app shows the first-run guide, or the current status once it is set up. If an
+  older version is still running (after you replaced the app), it offers to restart it.
   To see the guide again:  ~/Applications/WordBlock.app/Contents/MacOS/WordBlock --setup
 
   Re-running install.sh keeps the Accessibility permission, because the signing identity is stable.
